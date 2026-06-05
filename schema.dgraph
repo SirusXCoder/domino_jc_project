@@ -1,0 +1,40 @@
+player.id: string @index(exact) @upsert .
+player.username: string @index(exact) .
+player.email: string @index(exact) .
+player.created_at: datetime @index(hour) .
+
+game_session.session_id: string @index(exact) @upsert .
+game_session.status: string @index(exact) .
+game_session.current_turn: uid .
+game_session.created_at: datetime @index(hour) .
+game_session.players: [uid] .
+
+match_record.match_id: string @index(exact) @upsert .
+match_record.winner: uid .
+match_record.scores: string .
+match_record.end_time: datetime @index(hour) .
+match_record.players: [uid] @reverse .
+
+type Player {
+  player.id
+  player.username
+  player.email
+  player.created_at
+  <~match_record.players>
+}
+
+type GameSession {
+  game_session.session_id
+  game_session.status
+  game_session.current_turn
+  game_session.created_at
+  game_session.players
+}
+
+type MatchRecord {
+  match_record.match_id
+  match_record.winner
+  match_record.scores
+  match_record.end_time
+  match_record.players
+}

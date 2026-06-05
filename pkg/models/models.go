@@ -5,21 +5,21 @@ import (
 	"time"
 )
 
-// Dgraph node type names.
+// Dgraph node type names (dgraph.type facet values).
 const (
 	TypePlayer      = "Player"
 	TypeGameSession = "GameSession"
 	TypeMatchRecord = "MatchRecord"
 )
 
-// Game session status values.
+// Game session status values stored in game_session.status.
 const (
 	SessionStatusWaiting   = "WAITING"
 	SessionStatusActive    = "ACTIVE"
 	SessionStatusCompleted = "COMPLETED"
 )
 
-// Tile represents a discrete domino piece with integer values.
+// Tile represents a discrete domino piece with integer values (in-memory play state).
 type Tile struct {
 	ID    string `json:"id"`
 	SideA int    `json:"side_a"`
@@ -29,7 +29,7 @@ type Tile struct {
 // Match represents the in-memory state of an active domino game instance.
 type Match struct {
 	ID          string            `json:"id"`
-	Status      string            `json:"status"` // "WAITING", "ACTIVE", "BLOCKED", "FINISHED"
+	Status      string            `json:"status"` // WAITING, ACTIVE, BLOCKED, FINISHED
 	Players     []string          `json:"players"`
 	CurrentTurn string            `json:"current_turn"`
 	Boneyard    []Tile            `json:"boneyard"`
@@ -38,30 +38,49 @@ type Match struct {
 	CreatedAt   time.Time         `json:"created_at"`
 }
 
-// Scores maps player UID to their final score for a completed match.
+// Scores maps player UID to their final pip count for a completed match.
 type Scores map[string]int
 
+// PlayerRef is a minimal Dgraph node reference used in mutations and queries
+// when only the UID is known.
+type PlayerRef struct {
+	UID string `json:"uid,omitempty"`
+}
+
 // Player is a registered platform user persisted in Dgraph.
+//
+// UID is assigned by Dgraph after insert; PlayerID is the stable application ID.
+// MatchHistory is populated via the reverse of match_record.players.
 type Player struct {
 	UID          string        `json:"uid,omitempty"`
 	DType        []string      `json:"dgraph.type,omitempty"`
+	PlayerID     string        `json:"player.id,omitempty"`
 	Username     string        `json:"player.username,omitempty"`
 	Email        string        `json:"player.email,omitempty"`
 	CreatedAt    time.Time     `json:"player.created_at,omitempty"`
 	MatchHistory []MatchRecord `json:"player.match_history,omitempty"`
 }
 
-// NewPlayer returns a Player node ready for Dgraph insertion.
-func NewPlayer(username, email string) Player {
+// NewPlayer returns a Player node ready for Dgraph upsert by player.id.
+func NewPlayer(playerID, username, email string) Player {
 	return Player{
 		DType:     []string{TypePlayer},
+		PlayerID:  playerID,
 		Username:  username,
 		Email:     email,
 		CreatedAt: time.Now().UTC(),
 	}
 }
 
-// GameSession groups players in a lobby or active table before/during play.
+// Ref returns a UID-only reference suitable for edge mutations.
+func (p Player) Ref() PlayerRef {
+	return PlayerRef{UID: p.UID}
+}
+
+// GameSession groups players in a lobby or active table.
+//
+// CurrentTurn holds the Dgraph UID of the player whose turn it is.
+// Players lists full or partial Player nodes linked via game_session.players.
 type GameSession struct {
 	UID         string    `json:"uid,omitempty"`
 	DType       []string  `json:"dgraph.type,omitempty"`
@@ -82,7 +101,17 @@ func NewGameSession(sessionID string) GameSession {
 	}
 }
 
+// WithPlayers attaches UID-only player stubs for a mutation payload.
+func (s GameSession) WithPlayers(uids ...string) GameSession {
+	s.Players = PlayersByUID(uids...)
+	return s
+}
+
 // MatchRecord captures the outcome of a completed game.
+//
+// Winner is the Dgraph UID of the winning player.
+// Scores is JSON-encoded map[uid]int (see Scores and ParseScores).
+// Players should be set on insert; Player.match_history is filled via @reverse.
 type MatchRecord struct {
 	UID     string    `json:"uid,omitempty"`
 	DType   []string  `json:"dgraph.type,omitempty"`
@@ -121,4 +150,13 @@ func (m *MatchRecord) ParseScores() (Scores, error) {
 		return nil, err
 	}
 	return scores, nil
+}
+
+// PlayersByUID builds Player stubs containing only UID for relationship edges.
+func PlayersByUID(uids ...string) []Player {
+	out := make([]Player, len(uids))
+	for i, uid := range uids {
+		out[i] = Player{UID: uid, DType: []string{TypePlayer}}
+	}
+	return out
 }

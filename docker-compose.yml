@@ -9,6 +9,7 @@ services:
       - "5080:5080"
       - "6080:6080"
     command: dgraph zero --my=zero:5080
+
   alpha:
     image: dgraph/dgraph:latest
     container_name: domino_dgraph_alpha
@@ -17,7 +18,7 @@ services:
     ports:
       - "8280:8080"
       - "9080:9080"
-    command: dgraph alpha --my=alpha:7080 --zero=zero:5080
+    command: dgraph alpha --my=alpha:7080 --zero=zero:5080 --security "whitelist=0.0.0.0/0"
     depends_on:
       - zero
 
