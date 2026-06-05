@@ -1,0 +1,58 @@
+# Go binaries and build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/bin/
+/dist/
+/build/
+*.out
+
+# Go test and coverage artifacts
+*.test
+*.cover
+*.coverprofile
+coverage.txt
+coverage.html
+profile.cov
+
+# Go module cache and workspace (local only)
+/vendor/
+
+# Core dumps
+core
+core.*
+vgcore.*
+
+# Docker local data and temporary files
+.docker/
+*.log
+tmp/
+temp/
+.env
+.env.*
+!.env.example
+
+# Dgraph / compose local volume exports (if copied to project tree)
+dgraph_data/
+*.backup
+*.rdf
+*.gz
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Editor and IDE (optional local convenience)
+.idea/
+*.swp
+*.swo
+*~
+.vscode/

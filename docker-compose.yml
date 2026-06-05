@@ -1,0 +1,25 @@
+version: '3.8'
+services:
+  zero:
+    image: dgraph/dgraph:latest
+    container_name: domino_dgraph_zero
+    volumes:
+      - dgraph_data:/dgraph
+    ports:
+      - "5080:5080"
+      - "6080:6080"
+    command: dgraph zero --my=zero:5080
+  alpha:
+    image: dgraph/dgraph:latest
+    container_name: domino_dgraph_alpha
+    volumes:
+      - dgraph_data:/dgraph
+    ports:
+      - "8280:8080"
+      - "9080:9080"
+    command: dgraph alpha --my=alpha:7080 --zero=zero:5080
+    depends_on:
+      - zero
+
+volumes:
+  dgraph_data:
