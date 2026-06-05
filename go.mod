@@ -1,4 +1,4 @@
-module domino-backend
+module domino_jc_project
 
 go 1.25.0
 

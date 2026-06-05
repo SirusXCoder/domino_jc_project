@@ -19,22 +19,17 @@ const (
 	SessionStatusCompleted = "COMPLETED"
 )
 
-// Tile represents a discrete domino piece with integer values (in-memory play state).
-type Tile struct {
-	ID    string `json:"id"`
-	SideA int    `json:"side_a"`
-	SideB int    `json:"side_b"`
-}
-
 // Match represents the in-memory state of an active domino game instance.
 type Match struct {
 	ID          string            `json:"id"`
 	Status      string            `json:"status"` // WAITING, ACTIVE, BLOCKED, FINISHED
 	Players     []string          `json:"players"`
 	CurrentTurn string            `json:"current_turn"`
-	Boneyard    []Tile            `json:"boneyard"`
-	Hands       map[string][]Tile `json:"hands"`
-	Board       []Tile            `json:"board"`
+	Boneyard    []DominoTile      `json:"boneyard"`
+	PlayerHands []PlayerHand      `json:"player_hands"`
+	GameBoard   []DominoTile      `json:"game_board"`
+	OpenLeft    int               `json:"open_left"`
+	OpenRight   int               `json:"open_right"`
 	CreatedAt   time.Time         `json:"created_at"`
 }
 
@@ -75,36 +70,6 @@ func NewPlayer(playerID, username, email string) Player {
 // Ref returns a UID-only reference suitable for edge mutations.
 func (p Player) Ref() PlayerRef {
 	return PlayerRef{UID: p.UID}
-}
-
-// GameSession groups players in a lobby or active table.
-//
-// CurrentTurn holds the Dgraph UID of the player whose turn it is.
-// Players lists full or partial Player nodes linked via game_session.players.
-type GameSession struct {
-	UID         string    `json:"uid,omitempty"`
-	DType       []string  `json:"dgraph.type,omitempty"`
-	SessionID   string    `json:"game_session.session_id,omitempty"`
-	Status      string    `json:"game_session.status,omitempty"`
-	CurrentTurn string    `json:"game_session.current_turn,omitempty"`
-	CreatedAt   time.Time `json:"game_session.created_at,omitempty"`
-	Players     []Player  `json:"game_session.players,omitempty"`
-}
-
-// NewGameSession returns a GameSession node in WAITING status.
-func NewGameSession(sessionID string) GameSession {
-	return GameSession{
-		DType:     []string{TypeGameSession},
-		SessionID: sessionID,
-		Status:    SessionStatusWaiting,
-		CreatedAt: time.Now().UTC(),
-	}
-}
-
-// WithPlayers attaches UID-only player stubs for a mutation payload.
-func (s GameSession) WithPlayers(uids ...string) GameSession {
-	s.Players = PlayersByUID(uids...)
-	return s
 }
 
 // MatchRecord captures the outcome of a completed game.

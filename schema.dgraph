@@ -8,6 +8,11 @@ game_session.status: string @index(exact) .
 game_session.current_turn: uid .
 game_session.created_at: datetime @index(hour) .
 game_session.players: [uid] .
+game_session.open_left: int .
+game_session.open_right: int .
+game_session.boneyard: string .
+game_session.game_board: string .
+game_session.player_hands: string .
 
 match_record.match_id: string @index(exact) @upsert .
 match_record.winner: uid .
@@ -29,6 +34,11 @@ type GameSession {
   game_session.current_turn
   game_session.created_at
   game_session.players
+  game_session.open_left
+  game_session.open_right
+  game_session.boneyard
+  game_session.game_board
+  game_session.player_hands
 }
 
 type MatchRecord {

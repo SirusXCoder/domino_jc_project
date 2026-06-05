@@ -3,7 +3,8 @@ package database
 import (
 	"context"
 	"fmt"
-	"strings"
+	"log"
+	"time"
 
 	"github.com/dgraph-io/dgo/v210"
 	"github.com/dgraph-io/dgo/v210/protos/api"
@@ -11,84 +12,33 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-const defaultGRPCPort = "9080"
-
-// DgraphClient wraps the official Dgraph Go client and manages underlying gRPC connections.
-type DgraphClient struct {
-	client *dgo.Dgraph
-	conns  []*grpc.ClientConn
+// Config holds the configuration details for connecting to Dgraph.
+type Config struct {
+	Address string // e.g., "localhost:9080"
 }
 
-// NewClient establishes a gRPC connection pool to one or more Dgraph Alpha nodes.
-// Each host may be a bare hostname/IP (port 9080 is assumed) or a full host:port address.
-func NewClient(hosts []string) (*DgraphClient, error) {
-	if len(hosts) == 0 {
-		return nil, fmt.Errorf("at least one Dgraph Alpha host is required")
-	}
+// InitDgraphClient establishes a gRPC connection pool and returns an initialized Dgraph client.
+// It also returns the underlying grpc.ClientConn so it can be closed gracefully upon application shutdown.
+func InitDgraphClient(cfg Config) (*dgo.Dgraph, *grpc.ClientConn, error) {
+	// Set up a connection timeout context
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	apiClients := make([]api.DgraphClient, 0, len(hosts))
-	conns := make([]*grpc.ClientConn, 0, len(hosts))
+	log.Printf("Connecting to Dgraph alpha node at %s...", cfg.Address)
 
-	for _, host := range hosts {
-		addr := normalizeHost(host)
-		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			closeConns(conns)
-			return nil, fmt.Errorf("dial %s: %w", addr, err)
-		}
-		conns = append(conns, conn)
-		apiClients = append(apiClients, api.NewDgraphClient(conn))
-	}
-
-	return &DgraphClient{
-		client: dgo.NewDgraphClient(apiClients...),
-		conns:  conns,
-	}, nil
-}
-
-// Close tears down all gRPC connections held by the client.
-func (c *DgraphClient) Close() error {
-	return closeConns(c.conns)
-}
-
-// ExecuteQuery runs a DQL query inside a read-write transaction.
-func (c *DgraphClient) ExecuteQuery(ctx context.Context, query string, vars map[string]string) (*api.Response, error) {
-	txn := c.client.NewTxn()
-	defer txn.Discard(ctx)
-
-	return txn.QueryWithVars(ctx, query, vars)
-}
-
-// ExecuteMutation applies a mutation and commits the transaction.
-func (c *DgraphClient) ExecuteMutation(ctx context.Context, mu *api.Mutation) (*api.Response, error) {
-	txn := c.client.NewTxn()
-	defer txn.Discard(ctx)
-
-	resp, err := txn.Mutate(ctx, mu)
+	// Dial the Dgraph gRPC endpoint. Using insecure credentials for local setup; 
+	// exchange for transport credentials (TLS) in production if needed.
+	conn, err := grpc.DialContext(ctx, cfg.Address, 
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(), // Block until the connection is established or times out
+	)
 	if err != nil {
-		return nil, err
+		return nil, nil, fmt.Errorf("failed to connect to Dgraph via gRPC: %w", err)
 	}
 
-	if err := txn.Commit(ctx); err != nil {
-		return nil, err
-	}
+	// Create the Dgraph client using the operational gRPC connection pool
+	dgraphClient := dgo.NewDgraphClient(api.NewDgraphClient(conn))
 
-	return resp, nil
-}
-
-func normalizeHost(host string) string {
-	if strings.Contains(host, ":") {
-		return host
-	}
-	return host + ":" + defaultGRPCPort
-}
-
-func closeConns(conns []*grpc.ClientConn) error {
-	var firstErr error
-	for _, conn := range conns {
-		if err := conn.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
+	log.Println("Successfully initialized Dgraph client connection pool.")
+	return dgraphClient, conn, nil
 }
