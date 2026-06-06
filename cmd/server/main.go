@@ -57,7 +57,11 @@ func main() {
 	log.Println("Game repository layer and orchestrator successfully initialized with live connection pool.")
 
 	// 7. Start the WebSocket hub with bidirectional event routing into GameManager.
-	hub := ws.NewHub(gameManager)
+	ledgerWorker := engine.NewLedgerWorker(gameRepo, 0)
+	go ledgerWorker.Run()
+
+	hub := ws.NewHub(gameManager, ws.WithMatchLedger(ledgerWorker))
+	gameManager.SetMatchTerminator(hub)
 	go hub.Run()
 
 	wsHandler := ws.NewHandler(hub)

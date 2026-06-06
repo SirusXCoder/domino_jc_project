@@ -6,7 +6,14 @@ import (
 	"log"
 	"sync"
 	"time"
+
+	"domino_jc_project/pkg/models"
 )
+
+// MatchLedger enqueues immutable match records for async persistence.
+type MatchLedger interface {
+	Enqueue(record models.MatchRecord)
+}
 
 // InboundMessage carries a validated inbound payload from a connected client.
 type InboundMessage struct {
@@ -43,6 +50,7 @@ type Hub struct {
 
 	router              *EventRouter
 	actions             GameActionHandler
+	ledger              MatchLedger
 	reconnectGracePeriod time.Duration
 
 	mu sync.RWMutex
@@ -55,6 +63,13 @@ type HubOption func(*Hub)
 func WithReconnectGracePeriod(d time.Duration) HubOption {
 	return func(h *Hub) {
 		h.reconnectGracePeriod = d
+	}
+}
+
+// WithMatchLedger attaches the async ledger worker used when matches terminate.
+func WithMatchLedger(ledger MatchLedger) HubOption {
+	return func(h *Hub) {
+		h.ledger = ledger
 	}
 }
 
@@ -322,4 +337,80 @@ func (h *Hub) PlayerConnectionStatus(sessionID, playerID string) ConnectionStatu
 		return ""
 	}
 	return state.status
+}
+
+// TerminateMatch broadcasts the final match frame to all connected peers and
+// enqueues an immutable snapshot for the ledger worker.
+func (h *Hub) TerminateMatch(_ context.Context, sessionID string, outcome *models.MatchOutcome, session *models.GameSession) {
+	if outcome == nil || session == nil {
+		log.Printf("ws: TerminateMatch skipped session=%s (missing outcome or session)", sessionID)
+		return
+	}
+
+	matchPayload, err := json.Marshal(MatchEndPayload{
+		SessionID: sessionID,
+		WinnerID:  outcome.WinnerID,
+		Reason:    outcome.Reason,
+		Scores:    outcome.Scores,
+		Status:    session.Status,
+	})
+	if err != nil {
+		log.Printf("ws: failed to marshal match end payload session=%s: %v", sessionID, err)
+		return
+	}
+
+	matchEnvelope, err := json.Marshal(EventEnvelope{
+		Type:      EventTypeMatchEnd,
+		Timestamp: time.Now().UnixMilli(),
+		Payload:   matchPayload,
+	})
+	if err != nil {
+		log.Printf("ws: failed to marshal match end envelope session=%s: %v", sessionID, err)
+		return
+	}
+
+	sessionPayload, err := json.Marshal(session)
+	if err != nil {
+		log.Printf("ws: failed to marshal final session snapshot session=%s: %v", sessionID, err)
+		return
+	}
+
+	snapshotEnvelope, err := json.Marshal(EventEnvelope{
+		Type:      EventTypeStateSnapshot,
+		Timestamp: time.Now().UnixMilli(),
+		Payload:   sessionPayload,
+	})
+	if err != nil {
+		log.Printf("ws: failed to marshal final snapshot envelope session=%s: %v", sessionID, err)
+		return
+	}
+
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	players, ok := h.clients[sessionID]
+	if !ok {
+		log.Printf("ws: TerminateMatch session=%s has no connected clients", sessionID)
+	} else {
+		for playerID := range players {
+			h.sendToPlayerLocked(sessionID, playerID, matchEnvelope)
+			h.sendToPlayerLocked(sessionID, playerID, snapshotEnvelope)
+		}
+	}
+
+	if h.ledger != nil {
+		players := make([]models.Player, len(session.Players))
+		for i, playerID := range session.Players {
+			players[i] = models.Player{
+				PlayerID: playerID,
+				DType:    []string{models.TypePlayer},
+			}
+		}
+		record, err := models.NewMatchRecord(outcome.MatchID, outcome.WinnerID, outcome.Scores, players)
+		if err != nil {
+			log.Printf("ws: failed to build ledger record session=%s: %v", sessionID, err)
+			return
+		}
+		h.ledger.Enqueue(record)
+	}
 }

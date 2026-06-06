@@ -14,24 +14,16 @@ func (m *GameManager) ApplyPlayTile(
 	tile models.DominoTile,
 	playAtLeft bool,
 ) (bool, error) {
-	entry, err := m.lookupSession(ctx, sessionID)
+	result, err := m.processGameTurn(ctx, sessionID, models.TurnAction{
+		Kind:       models.TurnKindPlayTile,
+		PlayerID:   playerID,
+		Tile:       tile,
+		PlayAtLeft: playAtLeft,
+	})
 	if err != nil {
 		return false, err
 	}
-
-	entry.mu.Lock()
-	defer entry.mu.Unlock()
-
-	success, err := entry.session.PlayTile(playerID, tile, playAtLeft)
-	if err != nil || !success {
-		return success, err
-	}
-
-	if err := m.persistState(ctx, entry.session); err != nil {
-		return false, err
-	}
-
-	return true, nil
+	return result.Applied, nil
 }
 
 // ApplyDrawFromBoneyard draws the top tile from the boneyard into the active player's hand.
@@ -40,19 +32,14 @@ func (m *GameManager) ApplyDrawFromBoneyard(
 	ctx context.Context,
 	sessionID, playerID string,
 ) (*models.DominoTile, error) {
-	var drawnTile *models.DominoTile
-	err := m.withSessionWrite(ctx, sessionID, func(session *models.GameSession) error {
-		tile, drawErr := session.DrawFromBoneyard(playerID)
-		if drawErr != nil {
-			return drawErr
-		}
-		drawnTile = tile
-		return nil
+	result, err := m.processGameTurn(ctx, sessionID, models.TurnAction{
+		Kind:     models.TurnKindDraw,
+		PlayerID: playerID,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return drawnTile, nil
+	return result.DrawnTile, nil
 }
 
 // ApplyPassTurn marks the active player's turn as passed and rotates to the next player.
@@ -61,7 +48,9 @@ func (m *GameManager) ApplyPassTurn(
 	ctx context.Context,
 	sessionID, playerID string,
 ) error {
-	return m.withSessionWrite(ctx, sessionID, func(session *models.GameSession) error {
-		return session.PassTurn(playerID)
+	_, err := m.processGameTurn(ctx, sessionID, models.TurnAction{
+		Kind:     models.TurnKindPass,
+		PlayerID: playerID,
 	})
+	return err
 }

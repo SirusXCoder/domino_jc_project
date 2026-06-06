@@ -16,6 +16,7 @@ const (
 	EventTypeJoin             = "JOIN"
 	EventTypeLeave            = "LEAVE"
 	EventTypeStateSnapshot    = "STATE_SNAPSHOT"
+	EventTypeMatchEnd         = "MATCH_END"
 	EventTypeError            = "ERROR"
 )
 
@@ -39,6 +40,7 @@ const (
 	ErrCodeSessionMismatch  = "SESSION_MISMATCH"
 	ErrCodePlayerMismatch   = "PLAYER_MISMATCH"
 	ErrCodeMoveRejected     = "MOVE_REJECTED"
+	ErrCodeSessionLocked    = "SESSION_LOCKED"
 	ErrCodeNotImplemented   = "ACTION_NOT_SUPPORTED"
 )
 
@@ -97,6 +99,15 @@ type JoinPayload struct {
 type LeavePayload struct {
 	SessionID string `json:"session_id"`
 	PlayerID  string `json:"player_id"`
+}
+
+// MatchEndPayload is broadcast when a match completes.
+type MatchEndPayload struct {
+	SessionID string        `json:"session_id"`
+	WinnerID  string        `json:"winner_id"`
+	Reason    string        `json:"reason"`
+	Scores    models.Scores `json:"scores"`
+	Status    string        `json:"status"`
 }
 
 func newErrorEnvelope(code, message string) ([]byte, error) {

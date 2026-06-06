@@ -26,6 +26,8 @@ type GameManager struct {
 	recoveredIDs map[string]bool
 	hydrating    map[string]*sync.WaitGroup
 	repo         repository.GameRepository
+
+	matchTerminator MatchTerminator
 }
 
 // NewGameManager constructs a GameManager backed by the given repository.

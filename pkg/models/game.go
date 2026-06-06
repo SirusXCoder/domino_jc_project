@@ -54,6 +54,9 @@ type GameSession struct {
 	RightOpenValue int          `json:"right_open_value"`
 	CurrentTurn    string       `json:"current_turn"`
 
+	// MutationsLocked is set when a match completes; further turn actions are rejected.
+	MutationsLocked bool `json:"mutations_locked,omitempty"`
+
 	// Dgraph-specific persistence blobs
 	BoneyardRaw  string `json:"boneyard_raw,omitempty"`
 	GameBoardRaw string `json:"game_board_raw,omitempty"`

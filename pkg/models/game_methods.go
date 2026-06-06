@@ -75,11 +75,74 @@ func StandardDoubleSixDeck() []DominoTile {
 	return deck
 }
 
+// ProcessGameTurn applies a player action, evaluates match completion, and reports
+// whether the caller should persist via gRPC upsert.
+func (s *GameSession) ProcessGameTurn(action TurnAction) (*TurnResult, error) {
+	if s.MutationsLocked || s.Status == SessionStatusCompleted {
+		return nil, ErrMutationsLocked
+	}
+
+	result := &TurnResult{}
+
+	switch action.Kind {
+	case TurnKindPlayTile:
+		success, err := s.PlayTile(action.PlayerID, action.Tile, action.PlayAtLeft)
+		if err != nil {
+			return nil, err
+		}
+		if !success {
+			return result, nil
+		}
+		result.Applied = true
+
+	case TurnKindDraw:
+		drawn, err := s.DrawFromBoneyard(action.PlayerID)
+		if err != nil {
+			return nil, err
+		}
+		result.Applied = true
+		result.DrawnTile = drawn
+
+	case TurnKindPass:
+		if err := s.PassTurn(action.PlayerID); err != nil {
+			return nil, err
+		}
+		result.Applied = true
+
+	default:
+		return nil, fmt.Errorf("unsupported turn action kind %q", action.Kind)
+	}
+
+	if !result.Applied {
+		return result, nil
+	}
+
+	if s.Status == SessionStatusWaiting {
+		s.Status = SessionStatusActive
+	}
+	result.NeedsPersist = true
+
+	if outcome, ended := EvaluateMatch(s); ended {
+		result.MatchEnded = true
+		result.Outcome = outcome
+		s.lockForCompletion()
+	} else if action.Kind == TurnKindPlayTile {
+		s.RotateTurn()
+	}
+
+	return result, nil
+}
+
+func (s *GameSession) lockForCompletion() {
+	s.MutationsLocked = true
+	s.Status = SessionStatusCompleted
+}
+
 // NewGameSession initializes a fresh game session state.
 func NewGameSession(sessionID string, playerUIDs []string) *GameSession {
 	session := &GameSession{
 		SessionID:      sessionID,
-		Status:         "waiting",
+		Status:         SessionStatusWaiting,
 		Players:        playerUIDs,
 		Hands:          make([]PlayerHand, 0, len(playerUIDs)),
 		Boneyard:       make([]DominoTile, 0),

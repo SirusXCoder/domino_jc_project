@@ -265,6 +265,9 @@ func isSessionNotFound(err error) bool {
 }
 
 func mapActionError(err error) (code, message string) {
+	if errors.Is(err, models.ErrMutationsLocked) {
+		return ErrCodeSessionLocked, err.Error()
+	}
 	if isSessionNotFound(err) {
 		return ErrCodeSessionNotFound, err.Error()
 	}

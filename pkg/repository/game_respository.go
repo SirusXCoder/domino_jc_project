@@ -16,6 +16,7 @@ type GameRepository interface {
 	SaveSession(ctx context.Context, session *models.GameSession) error
 	GetSession(ctx context.Context, sessionID string) (*models.GameSession, error)
 	ListActiveSessionIDs(ctx context.Context) ([]string, error)
+	MatchLedgerRepository
 }
 
 // dgraphGameRepository is the concrete implementation backed by Dgraph.
@@ -157,4 +158,26 @@ func (r *dgraphGameRepository) ListActiveSessionIDs(ctx context.Context) ([]stri
 		}
 	}
 	return ids, nil
+}
+
+// SaveMatchRecord upserts an immutable match outcome node into Dgraph.
+func (r *dgraphGameRepository) SaveMatchRecord(ctx context.Context, record models.MatchRecord) error {
+	mu := &api.Mutation{
+		CommitNow: true,
+	}
+
+	recordJSON, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("failed to marshal match record: %w", err)
+	}
+	mu.SetJson = recordJSON
+
+	txn := r.dg.NewTxn()
+	defer txn.Discard(ctx)
+
+	if _, err := txn.Mutate(ctx, mu); err != nil {
+		return fmt.Errorf("failed to persist match record: %w", err)
+	}
+
+	return nil
 }
