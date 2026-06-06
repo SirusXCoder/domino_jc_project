@@ -36,8 +36,9 @@ type PlayerHand struct {
 	UID       string       `json:"uid,omitempty"`
 	PlayerID  string       `json:"player_id"`
 	Tiles     []DominoTile `json:"tiles"`
-	HasPassed bool         `json:"has_passed"`
-	IsReady   bool         `json:"is_ready"`
+	HasPassed   bool `json:"has_passed"`
+	IsReady     bool `json:"is_ready"`
+	IsAbandoned bool `json:"is_abandoned"`
 }
 
 // GameSession represents the complete state of an active match.

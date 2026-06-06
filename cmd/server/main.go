@@ -1,14 +1,18 @@
 package main
 
 import (
+	"context"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"domino_jc_project/pkg/database"
 	"domino_jc_project/pkg/engine"
 	"domino_jc_project/pkg/repository"
+	"domino_jc_project/pkg/ws"
 )
 
 func main() {
@@ -45,16 +49,51 @@ func main() {
 
 	// 5. Wire the game orchestrator with repository-backed persistence
 	gameManager := engine.NewGameManager(gameRepo)
-	_ = gameManager
+
+	// 6. Register ACTIVE session IDs from Dgraph for lazy recovery after restart
+	if err := gameManager.BootstrapActiveSessions(context.Background(), gameRepo); err != nil {
+		log.Fatalf("CRITICAL: Failed to bootstrap active sessions for crash recovery: %v", err)
+	}
 	log.Println("Game repository layer and orchestrator successfully initialized with live connection pool.")
 
-	// 6. Keep the server alive and listen for termination signals
+	// 7. Start the WebSocket hub with bidirectional event routing into GameManager.
+	hub := ws.NewHub(gameManager)
+	go hub.Run()
+
+	wsHandler := ws.NewHandler(hub)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws/connect", wsHandler.ServeConnect)
+
+	httpAddr := os.Getenv("HTTP_ADDR")
+	if httpAddr == "" {
+		httpAddr = ":8380"
+	}
+
+	httpServer := &http.Server{
+		Addr:              httpAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		log.Printf("WebSocket endpoint listening on %s/ws/connect", httpAddr)
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("CRITICAL: HTTP server failed: %v", err)
+		}
+	}()
+
+	// 8. Keep the server alive and listen for termination signals
 	log.Println("Domino JC Game Server is fully operational and running...")
-	
+
 	shutdownChan := make(chan os.Signal, 1)
 	signal.Notify(shutdownChan, os.Interrupt, syscall.SIGTERM)
 
-	// Block until a termination signal is caught
 	sig := <-shutdownChan
 	log.Printf("Captured system signal (%v). Initiating safe teardown sequence...", sig)
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Warning: HTTP server shutdown error: %v", err)
+	}
 }

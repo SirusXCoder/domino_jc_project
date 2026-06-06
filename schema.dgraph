@@ -4,7 +4,7 @@ player.email: string @index(exact) .
 player.created_at: datetime @index(hour) .
 
 game_session.session_id: string @index(exact) @upsert .
-game_session.status: string @index(exact) .
+game_session.status: string @index(hash) .
 game_session.current_turn: uid .
 game_session.created_at: datetime @index(hour) .
 game_session.players: [uid] .

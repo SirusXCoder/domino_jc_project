@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/dgraph-io/dgo/v210 v210.0.0-20230328113526-b66f8ae53a2d
+	github.com/gorilla/websocket v1.5.3
 	google.golang.org/grpc v1.81.1
 )
 

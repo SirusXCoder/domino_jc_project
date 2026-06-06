@@ -15,6 +15,7 @@ import (
 type GameRepository interface {
 	SaveSession(ctx context.Context, session *models.GameSession) error
 	GetSession(ctx context.Context, sessionID string) (*models.GameSession, error)
+	ListActiveSessionIDs(ctx context.Context) ([]string, error)
 }
 
 // dgraphGameRepository is the concrete implementation backed by Dgraph.
@@ -121,4 +122,39 @@ func (r *dgraphGameRepository) GetSession(ctx context.Context, sessionID string)
 	}
 
 	return session, nil
+}
+
+// ListActiveSessionIDs returns session_id values for all persisted games marked ACTIVE.
+func (r *dgraphGameRepository) ListActiveSessionIDs(ctx context.Context) ([]string, error) {
+	const query = `
+	query {
+		sessions(func: eq(game_session.status, "ACTIVE")) {
+			game_session.session_id
+		}
+	}`
+
+	txn := r.dg.NewReadOnlyTxn()
+	defer txn.Discard(ctx)
+
+	resp, err := txn.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query active session IDs: %w", err)
+	}
+
+	var result struct {
+		Sessions []struct {
+			SessionID string `json:"game_session.session_id"`
+		} `json:"sessions"`
+	}
+	if err := json.Unmarshal(resp.GetJson(), &result); err != nil {
+		return nil, fmt.Errorf("failed to parse active session ID response: %w", err)
+	}
+
+	ids := make([]string, 0, len(result.Sessions))
+	for _, s := range result.Sessions {
+		if s.SessionID != "" {
+			ids = append(ids, s.SessionID)
+		}
+	}
+	return ids, nil
 }

@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"fmt"
 
 	"domino_jc_project/pkg/models"
 )
@@ -15,20 +14,20 @@ func (m *GameManager) ApplyPlayTile(
 	tile models.DominoTile,
 	playAtLeft bool,
 ) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	session, ok := m.sessions[sessionID]
-	if !ok {
-		return false, fmt.Errorf("session %q not found", sessionID)
+	entry, err := m.lookupSession(ctx, sessionID)
+	if err != nil {
+		return false, err
 	}
 
-	success, err := session.PlayTile(playerID, tile, playAtLeft)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
+	success, err := entry.session.PlayTile(playerID, tile, playAtLeft)
 	if err != nil || !success {
 		return success, err
 	}
 
-	if err := m.persistState(ctx, session); err != nil {
+	if err := m.persistState(ctx, entry.session); err != nil {
 		return false, err
 	}
 
@@ -41,23 +40,18 @@ func (m *GameManager) ApplyDrawFromBoneyard(
 	ctx context.Context,
 	sessionID, playerID string,
 ) (*models.DominoTile, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	session, ok := m.sessions[sessionID]
-	if !ok {
-		return nil, fmt.Errorf("session %q not found", sessionID)
-	}
-
-	drawnTile, err := session.DrawFromBoneyard(playerID)
+	var drawnTile *models.DominoTile
+	err := m.withSessionWrite(ctx, sessionID, func(session *models.GameSession) error {
+		tile, drawErr := session.DrawFromBoneyard(playerID)
+		if drawErr != nil {
+			return drawErr
+		}
+		drawnTile = tile
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	if err := m.persistState(ctx, session); err != nil {
-		return nil, err
-	}
-
 	return drawnTile, nil
 }
 
@@ -67,17 +61,7 @@ func (m *GameManager) ApplyPassTurn(
 	ctx context.Context,
 	sessionID, playerID string,
 ) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	session, ok := m.sessions[sessionID]
-	if !ok {
-		return fmt.Errorf("session %q not found", sessionID)
-	}
-
-	if err := session.PassTurn(playerID); err != nil {
-		return err
-	}
-
-	return m.persistState(ctx, session)
+	return m.withSessionWrite(ctx, sessionID, func(session *models.GameSession) error {
+		return session.PassTurn(playerID)
+	})
 }
