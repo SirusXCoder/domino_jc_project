@@ -146,3 +146,27 @@ func (t *trackingRepo) ListActiveSessionIDs(_ context.Context) ([]string, error)
 func (t *trackingRepo) SaveMatchRecord(_ context.Context, _ models.MatchRecord) error {
 	return nil
 }
+
+func (t *trackingRepo) GetPlayersByIDs(_ context.Context, _ []string) ([]models.Player, error) {
+	return nil, nil
+}
+
+func (t *trackingRepo) UpdatePlayerCareers(_ context.Context, _ []models.Player) error {
+	return nil
+}
+
+func (t *trackingRepo) ListLeaderboard(_ context.Context, _ int) ([]models.LeaderboardEntry, error) {
+	return nil, nil
+}
+
+func (t *trackingRepo) GetPlayerCareer(_ context.Context, _ string, _ int) (*models.PlayerCareerStats, error) {
+	return nil, nil
+}
+
+func (t *trackingRepo) GetMatchRecord(_ context.Context, _ string) (*models.MatchRecord, error) {
+	return nil, nil
+}
+
+func (t *trackingRepo) ApplyMatchRatings(_ context.Context, _ string, _ models.ELODeltas) error {
+	return nil
+}

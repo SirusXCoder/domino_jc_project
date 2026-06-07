@@ -49,6 +49,9 @@ func TestHub_TerminateMatchBroadcastsAndEnqueuesLedger(t *testing.T) {
 	if ledger.records[0].MatchID != "s1" {
 		t.Fatalf("ledger match_id = %q, want s1", ledger.records[0].MatchID)
 	}
+	if ledger.records[0].EndReason != models.MatchEndEmptyHand {
+		t.Fatalf("ledger end_reason = %q, want %q", ledger.records[0].EndReason, models.MatchEndEmptyHand)
+	}
 
 	var gotMatchEnd bool
 	var gotSnapshot bool

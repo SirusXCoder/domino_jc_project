@@ -406,7 +406,7 @@ func (h *Hub) TerminateMatch(_ context.Context, sessionID string, outcome *model
 				DType:    []string{models.TypePlayer},
 			}
 		}
-		record, err := models.NewMatchRecord(outcome.MatchID, outcome.WinnerID, outcome.Scores, players)
+		record, err := models.NewMatchRecord(outcome.MatchID, outcome.WinnerID, outcome.Scores, outcome.Reason, players)
 		if err != nil {
 			log.Printf("ws: failed to build ledger record session=%s: %v", sessionID, err)
 			return

@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"domino_jc_project/pkg/api"
 	"domino_jc_project/pkg/database"
 	"domino_jc_project/pkg/engine"
 	"domino_jc_project/pkg/repository"
@@ -57,7 +58,8 @@ func main() {
 	log.Println("Game repository layer and orchestrator successfully initialized with live connection pool.")
 
 	// 7. Start the WebSocket hub with bidirectional event routing into GameManager.
-	ledgerWorker := engine.NewLedgerWorker(gameRepo, 0)
+	ratingWorker := engine.NewRatingWorker(gameRepo)
+	ledgerWorker := engine.NewLedgerWorker(gameRepo, 0, engine.WithRatingProcessor(ratingWorker))
 	go ledgerWorker.Run()
 
 	hub := ws.NewHub(gameManager, ws.WithMatchLedger(ledgerWorker))
@@ -65,8 +67,11 @@ func main() {
 	go hub.Run()
 
 	wsHandler := ws.NewHandler(hub)
+	statsHandler := api.NewStatsHandler(gameRepo)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws/connect", wsHandler.ServeConnect)
+	statsHandler.Register(mux)
 
 	httpAddr := os.Getenv("HTTP_ADDR")
 	if httpAddr == "" {

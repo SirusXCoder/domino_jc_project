@@ -2,6 +2,12 @@ player.id: string @index(exact) @upsert .
 player.username: string @index(exact) .
 player.email: string @index(exact) .
 player.created_at: datetime @index(hour) .
+player.elo: float @index(float) .
+player.peak_elo: float .
+player.matches_played: int .
+player.wins: int .
+player.losses: int .
+player.last_match_at: datetime @index(hour) .
 
 game_session.session_id: string @index(exact) @upsert .
 game_session.status: string @index(hash) .
@@ -18,6 +24,9 @@ match_record.match_id: string @index(exact) @upsert .
 match_record.winner: uid .
 match_record.scores: string .
 match_record.end_time: datetime @index(hour) .
+match_record.end_reason: string @index(hash) .
+match_record.elo_deltas: string .
+match_record.ratings_applied: bool .
 match_record.players: [uid] @reverse .
 
 type Player {
@@ -25,6 +34,12 @@ type Player {
   player.username
   player.email
   player.created_at
+  player.elo
+  player.peak_elo
+  player.matches_played
+  player.wins
+  player.losses
+  player.last_match_at
   <~match_record.players>
 }
 
@@ -46,5 +61,8 @@ type MatchRecord {
   match_record.winner
   match_record.scores
   match_record.end_time
+  match_record.end_reason
+  match_record.elo_deltas
+  match_record.ratings_applied
   match_record.players
 }

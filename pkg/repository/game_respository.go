@@ -17,6 +17,7 @@ type GameRepository interface {
 	GetSession(ctx context.Context, sessionID string) (*models.GameSession, error)
 	ListActiveSessionIDs(ctx context.Context) ([]string, error)
 	MatchLedgerRepository
+	StatsRepository
 }
 
 // dgraphGameRepository is the concrete implementation backed by Dgraph.
