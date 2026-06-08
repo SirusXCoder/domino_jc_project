@@ -113,20 +113,22 @@ func (h *StatsHandler) handlePlayerMatches(w http.ResponseWriter, r *http.Reques
 		limit = parsed
 	}
 
-	stats, err := h.stats.GetPlayerCareer(r.Context(), playerID, limit)
+	cursor := r.URL.Query().Get("cursor")
+	page, err := h.stats.ListPlayerMatchHistory(r.Context(), playerID, limit, cursor)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if strings.Contains(err.Error(), "invalid cursor") {
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"player_id": playerID,
-		"matches":   stats.RecentMatches,
-	})
+	writeJSON(w, http.StatusOK, page)
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload interface{}) {

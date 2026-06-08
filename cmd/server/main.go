@@ -13,6 +13,7 @@ import (
 	"domino_jc_project/pkg/database"
 	"domino_jc_project/pkg/engine"
 	"domino_jc_project/pkg/repository"
+	"domino_jc_project/pkg/resilience"
 	"domino_jc_project/pkg/ws"
 )
 
@@ -58,13 +59,25 @@ func main() {
 	log.Println("Game repository layer and orchestrator successfully initialized with live connection pool.")
 
 	// 7. Start the WebSocket hub with bidirectional event routing into GameManager.
-	ratingWorker := engine.NewRatingWorker(gameRepo)
-	ledgerWorker := engine.NewLedgerWorker(gameRepo, 0, engine.WithRatingProcessor(ratingWorker))
-	go ledgerWorker.Run()
+	ledgerBreaker := resilience.NewBreaker(resilience.DefaultBreakerConfig("ledger"))
+	ratingBreaker := resilience.NewBreaker(resilience.DefaultBreakerConfig("rating"))
 
-	hub := ws.NewHub(gameManager, ws.WithMatchLedger(ledgerWorker))
+	hub := ws.NewHub(gameManager)
+	ratingWorker := engine.NewRatingWorker(
+		gameRepo,
+		engine.WithStatsBroadcaster(hub),
+		engine.WithRatingBreaker(ratingBreaker),
+	)
+	ledgerWorker := engine.NewLedgerWorker(
+		gameRepo,
+		0,
+		engine.WithRatingProcessor(ratingWorker),
+		engine.WithLedgerBreaker(ledgerBreaker),
+	)
+	hub.SetMatchLedger(ledgerWorker)
 	gameManager.SetMatchTerminator(hub)
 	go hub.Run()
+	go ledgerWorker.Run()
 
 	wsHandler := ws.NewHandler(hub)
 	statsHandler := api.NewStatsHandler(gameRepo)

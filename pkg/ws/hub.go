@@ -28,6 +28,12 @@ type abandonmentEvent struct {
 	playerID  string
 }
 
+// statsBroadcastEvent carries post-rating updates for targeted fan-out.
+type statsBroadcastEvent struct {
+	sessionID string
+	updates   []models.PlayerStatsUpdate
+}
+
 // playerConnection tracks connection lifecycle independent of the live socket.
 type playerConnection struct {
 	status ConnectionStatus
@@ -47,6 +53,10 @@ type Hub struct {
 	unregister chan *Client
 	inbound    chan *InboundMessage
 	abandon    chan abandonmentEvent
+	stats      chan statsBroadcastEvent
+
+	// pendingStats buffers final rating payloads for disconnected players.
+	pendingStats map[string]map[string][][]byte
 
 	router              *EventRouter
 	actions             GameActionHandler
@@ -73,6 +83,11 @@ func WithMatchLedger(ledger MatchLedger) HubOption {
 	}
 }
 
+// SetMatchLedger attaches the ledger worker after hub construction (breaks init cycles).
+func (h *Hub) SetMatchLedger(ledger MatchLedger) {
+	h.ledger = ledger
+}
+
 // NewHub constructs a Hub ready to process connection lifecycle events.
 // Pass a non-nil GameActionHandler to enable inbound event routing and
 // abandonment workflows; nil keeps the hub in connection-only mode.
@@ -80,10 +95,12 @@ func NewHub(actions GameActionHandler, opts ...HubOption) *Hub {
 	h := &Hub{
 		clients:              make(map[string]map[string]*Client),
 		playerStates:         make(map[string]map[string]*playerConnection),
+		pendingStats:         make(map[string]map[string][][]byte),
 		register:             make(chan *Client),
 		unregister:           make(chan *Client),
 		inbound:              make(chan *InboundMessage, 256),
 		abandon:              make(chan abandonmentEvent, 64),
+		stats:                make(chan statsBroadcastEvent, 256),
 		actions:              actions,
 		reconnectGracePeriod: reconnectGracePeriod,
 	}
@@ -112,6 +129,9 @@ func (h *Hub) Run() {
 
 		case evt := <-h.abandon:
 			h.handleAbandonment(evt)
+
+		case evt := <-h.stats:
+			h.handleStatsBroadcast(evt)
 		}
 	}
 }
@@ -144,6 +164,7 @@ func (h *Hub) registerClient(client *Client) {
 
 	log.Printf("ws: registered session=%s player=%s (session_clients=%d)", client.sessionID, client.playerID, len(players))
 
+	h.flushPendingStatsLocked(client.sessionID, client.playerID)
 	if h.actions != nil {
 		h.sendStateSnapshotLocked(client.sessionID, client.playerID)
 	}
@@ -413,4 +434,134 @@ func (h *Hub) TerminateMatch(_ context.Context, sessionID string, outcome *model
 		}
 		h.ledger.Enqueue(record)
 	}
+}
+
+// BroadcastPlayerStatsUpdate enqueues career stat updates for thread-safe hub delivery.
+// Implements ws.StatsBroadcaster; safe to call from any goroutine.
+func (h *Hub) BroadcastPlayerStatsUpdate(sessionID string, updates []models.PlayerStatsUpdate) {
+	if sessionID == "" || len(updates) == 0 {
+		return
+	}
+	select {
+	case h.stats <- statsBroadcastEvent{sessionID: sessionID, updates: updates}:
+	default:
+		log.Printf("ws: stats broadcast channel full session=%s", sessionID)
+	}
+}
+
+func (h *Hub) handleStatsBroadcast(evt statsBroadcastEvent) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for _, update := range evt.updates {
+		payload, err := json.Marshal(PlayerStatsUpdatedPayload{
+			SessionID:     update.SessionID,
+			MatchID:       update.MatchID,
+			PlayerID:      update.PlayerID,
+			ELO:           update.ELO,
+			PeakELO:       update.PeakELO,
+			MatchesPlayed: update.MatchesPlayed,
+			Wins:          update.Wins,
+			Losses:        update.Losses,
+			ELODelta:      update.ELODelta,
+			Won:           update.Won,
+		})
+		if err != nil {
+			log.Printf("ws: failed to marshal stats update session=%s player=%s: %v", evt.sessionID, update.PlayerID, err)
+			continue
+		}
+
+		envelope, err := json.Marshal(EventEnvelope{
+			Type:      EventTypePlayerStatsUpdated,
+			Timestamp: time.Now().UnixMilli(),
+			Payload:   payload,
+		})
+		if err != nil {
+			log.Printf("ws: failed to marshal stats envelope session=%s player=%s: %v", evt.sessionID, update.PlayerID, err)
+			continue
+		}
+
+		if h.deliverOrBufferStatsLocked(evt.sessionID, update.PlayerID, envelope) {
+			log.Printf("ws: delivered stats update session=%s player=%s match=%s", evt.sessionID, update.PlayerID, update.MatchID)
+		}
+	}
+}
+
+func (h *Hub) deliverOrBufferStatsLocked(sessionID, playerID string, envelope []byte) bool {
+	players, ok := h.clients[sessionID]
+	if ok {
+		if client, connected := players[playerID]; connected {
+			select {
+			case client.send <- envelope:
+				return true
+			default:
+				log.Printf("ws: stats outbound buffer full session=%s player=%s", sessionID, playerID)
+			}
+		}
+	}
+
+	sessionPending, ok := h.pendingStats[sessionID]
+	if !ok {
+		sessionPending = make(map[string][][]byte)
+		h.pendingStats[sessionID] = sessionPending
+	}
+	sessionPending[playerID] = append(sessionPending[playerID], envelope)
+	return false
+}
+
+func (h *Hub) flushPendingStatsLocked(sessionID, playerID string) {
+	sessionPending, ok := h.pendingStats[sessionID]
+	if !ok {
+		return
+	}
+	pending, ok := sessionPending[playerID]
+	if !ok || len(pending) == 0 {
+		return
+	}
+
+	players, connected := h.clients[sessionID]
+	if !connected {
+		return
+	}
+	client, ok := players[playerID]
+	if !ok {
+		return
+	}
+
+	for _, envelope := range pending {
+		select {
+		case client.send <- envelope:
+		default:
+			log.Printf("ws: failed to flush pending stats session=%s player=%s", sessionID, playerID)
+			return
+		}
+	}
+	delete(sessionPending, playerID)
+	if len(sessionPending) == 0 {
+		delete(h.pendingStats, sessionID)
+	}
+	log.Printf("ws: flushed %d pending stats updates session=%s player=%s", len(pending), sessionID, playerID)
+}
+
+// PendingStatsCount returns buffered stat updates for a session/player (tests).
+func (h *Hub) PendingStatsCount(sessionID, playerID string) int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	sessionPending, ok := h.pendingStats[sessionID]
+	if !ok {
+		return 0
+	}
+	return len(sessionPending[playerID])
+}
+
+// RegisterTestClient registers a synthetic client for integration tests.
+func (h *Hub) RegisterTestClient(sessionID, playerID string, send chan []byte) {
+	client := &Client{
+		hub:       h,
+		sessionID: sessionID,
+		playerID:  playerID,
+		send:      send,
+	}
+	h.register <- client
 }

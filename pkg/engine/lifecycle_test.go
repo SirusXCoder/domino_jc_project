@@ -170,3 +170,19 @@ func (t *trackingRepo) GetMatchRecord(_ context.Context, _ string) (*models.Matc
 func (t *trackingRepo) ApplyMatchRatings(_ context.Context, _ string, _ models.ELODeltas) error {
 	return nil
 }
+
+func (t *trackingRepo) GetPlayerProfile(_ context.Context, _ string) (*models.PlayerCareerStats, error) {
+	return nil, nil
+}
+
+func (t *trackingRepo) ListPlayerMatchHistory(_ context.Context, _ string, _ int, _ string) (*models.MatchHistoryPage, error) {
+	return nil, nil
+}
+
+func (t *trackingRepo) GetLedgerState(_ context.Context, _ string) (*models.LedgerState, error) {
+	return nil, nil
+}
+
+func (t *trackingRepo) GetMatchWithPlayers(_ context.Context, _ string) (*models.MatchRecord, []models.Player, error) {
+	return nil, nil, nil
+}

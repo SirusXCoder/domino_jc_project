@@ -9,21 +9,86 @@ import (
 	"domino_jc_project/pkg/models"
 	"domino_jc_project/pkg/rating"
 	"domino_jc_project/pkg/repository"
+	"domino_jc_project/pkg/resilience"
+	"domino_jc_project/pkg/ws"
 )
 
 // RatingWorker applies ELO adjustments after immutable ledger rows are persisted.
 type RatingWorker struct {
-	stats repository.StatsRepository
+	stats       repository.StatsRepository
+	broadcaster ws.StatsBroadcaster
+	breaker     *resilience.Breaker
+	retry       resilience.RetryConfig
+}
+
+// RatingWorkerOption configures optional rating worker behavior.
+type RatingWorkerOption func(*RatingWorker)
+
+// WithStatsBroadcaster attaches a WebSocket dispatcher for live stat updates.
+func WithStatsBroadcaster(b ws.StatsBroadcaster) RatingWorkerOption {
+	return func(w *RatingWorker) {
+		w.broadcaster = b
+	}
+}
+
+// WithRatingBreaker attaches a circuit breaker around rating persistence.
+func WithRatingBreaker(b *resilience.Breaker) RatingWorkerOption {
+	return func(w *RatingWorker) {
+		w.breaker = b
+	}
+}
+
+// WithRatingRetry configures retry behavior for transient rating errors.
+func WithRatingRetry(cfg resilience.RetryConfig) RatingWorkerOption {
+	return func(w *RatingWorker) {
+		w.retry = cfg
+	}
 }
 
 // NewRatingWorker constructs a post-ledger rating processor.
-func NewRatingWorker(stats repository.StatsRepository) *RatingWorker {
-	return &RatingWorker{stats: stats}
+func NewRatingWorker(stats repository.StatsRepository, opts ...RatingWorkerOption) *RatingWorker {
+	w := &RatingWorker{
+		stats: stats,
+		retry: resilience.DefaultRetryConfig(),
+	}
+	for _, opt := range opts {
+		opt(w)
+	}
+	return w
+}
+
+// BreakerState exposes the current circuit breaker state for observability/tests.
+func (w *RatingWorker) BreakerState() resilience.State {
+	if w.breaker == nil {
+		return resilience.StateClosed
+	}
+	return w.breaker.State()
 }
 
 // ProcessMatch computes and persists career stats for a completed ledger row.
 func (w *RatingWorker) ProcessMatch(ctx context.Context, record models.MatchRecord) error {
-	stored, err := w.stats.GetMatchRecord(ctx, record.MatchID)
+	return w.runProtected(ctx, func() error {
+		return w.processMatch(ctx, record)
+	})
+}
+
+func (w *RatingWorker) runProtected(ctx context.Context, fn func() error) error {
+	if w.breaker == nil {
+		return resilience.Retry(ctx, w.retry, fn)
+	}
+	var err error
+	_, execErr := w.breaker.Execute(func() (interface{}, error) {
+		err = resilience.Retry(ctx, w.retry, fn)
+		return nil, err
+	})
+	if execErr != nil {
+		return execErr
+	}
+	return err
+}
+
+func (w *RatingWorker) processMatch(ctx context.Context, record models.MatchRecord) error {
+	stored, players, err := w.stats.GetMatchWithPlayers(ctx, record.MatchID)
 	if err != nil {
 		return err
 	}
@@ -31,24 +96,17 @@ func (w *RatingWorker) ProcessMatch(ctx context.Context, record models.MatchReco
 		return nil
 	}
 
-	playerIDs := make([]string, 0, len(stored.Players))
-	for _, player := range stored.Players {
-		if player.PlayerID != "" {
-			playerIDs = append(playerIDs, player.PlayerID)
+	playerIDs := make([]string, 0, len(players))
+	byID := make(map[string]models.Player, len(players))
+	for _, player := range players {
+		if player.PlayerID == "" {
+			continue
 		}
+		playerIDs = append(playerIDs, player.PlayerID)
+		byID[player.PlayerID] = player
 	}
 	if len(playerIDs) == 0 {
 		return nil
-	}
-
-	existing, err := w.stats.GetPlayersByIDs(ctx, playerIDs)
-	if err != nil {
-		return err
-	}
-
-	byID := make(map[string]models.Player, len(playerIDs))
-	for _, player := range existing {
-		byID[player.PlayerID] = player
 	}
 
 	participants := make([]rating.Participant, 0, len(playerIDs))
@@ -78,6 +136,7 @@ func (w *RatingWorker) ProcessMatch(ctx context.Context, record models.MatchReco
 	now := time.Now().UTC()
 	updates := make([]models.Player, 0, len(results))
 	deltas := make(models.ELODeltas, len(results))
+	statUpdates := make([]models.PlayerStatsUpdate, 0, len(results))
 
 	for _, result := range results {
 		player := byID[result.PlayerID]
@@ -97,6 +156,7 @@ func (w *RatingWorker) ProcessMatch(ctx context.Context, record models.MatchReco
 			losses++
 		}
 
+		delta := roundDelta(result.Delta)
 		updates = append(updates, models.Player{
 			PlayerID:      result.PlayerID,
 			ELO:           result.NewELO,
@@ -106,7 +166,19 @@ func (w *RatingWorker) ProcessMatch(ctx context.Context, record models.MatchReco
 			Losses:        losses,
 			LastMatchAt:   now,
 		})
-		deltas[result.PlayerID] = roundDelta(result.Delta)
+		deltas[result.PlayerID] = delta
+		statUpdates = append(statUpdates, models.PlayerStatsUpdate{
+			SessionID:     record.MatchID,
+			MatchID:       record.MatchID,
+			PlayerID:      result.PlayerID,
+			ELO:           result.NewELO,
+			PeakELO:       peak,
+			MatchesPlayed: result.MatchesPlayed,
+			Wins:          wins,
+			Losses:        losses,
+			ELODelta:      delta,
+			Won:           result.Won,
+		})
 	}
 
 	if err := w.stats.UpdatePlayerCareers(ctx, updates); err != nil {
@@ -124,6 +196,10 @@ func (w *RatingWorker) ProcessMatch(ctx context.Context, record models.MatchReco
 
 	if err := w.stats.ApplyMatchRatings(ctx, matchUID, deltas); err != nil {
 		return err
+	}
+
+	if w.broadcaster != nil {
+		w.broadcaster.BroadcastPlayerStatsUpdate(record.MatchID, statUpdates)
 	}
 
 	deltasJSON, _ := json.Marshal(deltas)

@@ -23,7 +23,16 @@ game_session.player_hands: string .
 match_record.match_id: string @index(exact) @upsert .
 match_record.winner: uid .
 match_record.scores: string .
-match_record.end_time: datetime @index(hour) .
+# Indexing notes (Phase 9):
+# - match_record.end_time @index(exact): supports cursor pagination filters (lt/eq composite cursors)
+# - match_record.match_id @index(exact): stable tie-break ordering alongside end_time
+# - player.elo @index(float): leaderboard orderdesc without post-filter sort
+# - player.id @index(exact) @upsert: point lookups for profiles and batch rating fetches
+# - match_record.players facets (role, placement_weight): edge metadata without full child expansion
+
+match_record.end_time: datetime @index(hour) @index(exact) .
+match_record.players|role: string .
+match_record.players|placement_weight: float .
 match_record.end_reason: string @index(hash) .
 match_record.elo_deltas: string .
 match_record.ratings_applied: bool .

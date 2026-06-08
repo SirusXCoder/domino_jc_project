@@ -8,11 +8,12 @@ import (
 )
 
 type stubStatsRepo struct {
-	match      *models.MatchRecord
-	players    []models.Player
-	updated    []models.Player
-	appliedUID string
-	applied    models.ELODeltas
+	match         *models.MatchRecord
+	players       []models.Player
+	updated       []models.Player
+	appliedUID    string
+	applied       models.ELODeltas
+	matchWithErr  error
 }
 
 func (s *stubStatsRepo) GetPlayersByIDs(_ context.Context, _ []string) ([]models.Player, error) {
@@ -40,6 +41,32 @@ func (s *stubStatsRepo) ApplyMatchRatings(_ context.Context, matchUID string, de
 	s.appliedUID = matchUID
 	s.applied = deltas
 	return nil
+}
+
+func (s *stubStatsRepo) GetPlayerProfile(_ context.Context, _ string) (*models.PlayerCareerStats, error) {
+	return nil, nil
+}
+
+func (s *stubStatsRepo) ListPlayerMatchHistory(_ context.Context, _ string, _ int, _ string) (*models.MatchHistoryPage, error) {
+	return nil, nil
+}
+
+func (s *stubStatsRepo) GetLedgerState(_ context.Context, _ string) (*models.LedgerState, error) {
+	return nil, nil
+}
+
+func (s *stubStatsRepo) GetMatchWithPlayers(_ context.Context, _ string) (*models.MatchRecord, []models.Player, error) {
+	if s.matchWithErr != nil {
+		return nil, nil, s.matchWithErr
+	}
+	if s.match == nil {
+		return nil, nil, nil
+	}
+	players := s.players
+	if len(players) == 0 {
+		players = s.match.Players
+	}
+	return s.match, players, nil
 }
 
 func TestRatingWorker_ProcessMatchUpdatesCareers(t *testing.T) {

@@ -17,6 +17,7 @@ const (
 	EventTypeLeave            = "LEAVE"
 	EventTypeStateSnapshot    = "STATE_SNAPSHOT"
 	EventTypeMatchEnd         = "MATCH_END"
+	EventTypePlayerStatsUpdated = "PLAYER_STATS_UPDATED"
 	EventTypeError            = "ERROR"
 )
 
@@ -108,6 +109,20 @@ type MatchEndPayload struct {
 	Reason    string        `json:"reason"`
 	Scores    models.Scores `json:"scores"`
 	Status    string        `json:"status"`
+}
+
+// PlayerStatsUpdatedPayload is pushed after ELO/career recalculation completes.
+type PlayerStatsUpdatedPayload struct {
+	SessionID     string  `json:"session_id"`
+	MatchID       string  `json:"match_id"`
+	PlayerID      string  `json:"player_id"`
+	ELO           float64 `json:"elo"`
+	PeakELO       float64 `json:"peak_elo"`
+	MatchesPlayed int     `json:"matches_played"`
+	Wins          int     `json:"wins"`
+	Losses        int     `json:"losses"`
+	ELODelta      float64 `json:"elo_delta"`
+	Won           bool    `json:"won"`
 }
 
 func newErrorEnvelope(code, message string) ([]byte, error) {
