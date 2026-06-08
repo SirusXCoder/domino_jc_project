@@ -2,23 +2,35 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/sony/gobreaker"
+
 	"domino_jc_project/pkg/api"
 	"domino_jc_project/pkg/database"
 	"domino_jc_project/pkg/engine"
 	"domino_jc_project/pkg/repository"
 	"domino_jc_project/pkg/resilience"
+	"domino_jc_project/pkg/telemetry"
 	"domino_jc_project/pkg/ws"
 )
 
 func main() {
-	log.Println("=== Initializing Domino JC Game Server ===")
+	logger := telemetry.InitLogger()
+	logger.Info("initializing Domino JC game server")
+
+	http.Handle("/metrics", promhttp.Handler())
+	go func() {
+		if err := http.ListenAndServe(":2112", nil); err != nil {
+			telemetry.AppLogger.Error("Telemetry server failed", "error", err)
+		}
+	}()
 
 	// 1. Grab connection target from environment or fall back to local default
 	dgraphAddr := os.Getenv("DGRAPH_ALPHA_GRPC")
@@ -33,16 +45,17 @@ func main() {
 	// 2. Initialize the gRPC Connection Pool
 	dgClient, grpcConn, err := database.InitDgraphClient(dbConfig)
 	if err != nil {
-		log.Fatalf("CRITICAL: Failed to initialize Dgraph connection pool: %v", err)
+		logger.Error("failed to initialize Dgraph connection pool", slog.Any("error", err))
+		os.Exit(1)
 	}
 
 	// 3. Defer closing the connection pool to handle graceful application shutdown
 	defer func() {
-		log.Println("Shutting down game server: Closing Dgraph gRPC connection pool...")
+		logger.Info("shutting down game server: closing Dgraph gRPC connection pool")
 		if err := grpcConn.Close(); err != nil {
-			log.Printf("Warning: Error closing gRPC connection pool: %v", err)
+			logger.Warn("error closing gRPC connection pool", slog.Any("error", err))
 		} else {
-			log.Println("gRPC connection pool successfully disconnected.")
+			logger.Info("gRPC connection pool successfully disconnected")
 		}
 	}()
 
@@ -54,13 +67,14 @@ func main() {
 
 	// 6. Register ACTIVE session IDs from Dgraph for lazy recovery after restart
 	if err := gameManager.BootstrapActiveSessions(context.Background(), gameRepo); err != nil {
-		log.Fatalf("CRITICAL: Failed to bootstrap active sessions for crash recovery: %v", err)
+		logger.Error("failed to bootstrap active sessions for crash recovery", slog.Any("error", err))
+		os.Exit(1)
 	}
-	log.Println("Game repository layer and orchestrator successfully initialized with live connection pool.")
+	logger.Info("game repository layer and orchestrator initialized")
 
 	// 7. Start the WebSocket hub with bidirectional event routing into GameManager.
-	ledgerBreaker := resilience.NewBreaker(resilience.DefaultBreakerConfig("ledger"))
-	ratingBreaker := resilience.NewBreaker(resilience.DefaultBreakerConfig("rating"))
+	ledgerBreaker := newBreakerWithMetrics("ledger")
+	ratingBreaker := newBreakerWithMetrics("rating")
 
 	hub := ws.NewHub(gameManager)
 	ratingWorker := engine.NewRatingWorker(
@@ -82,9 +96,15 @@ func main() {
 	wsHandler := ws.NewHandler(hub)
 	statsHandler := api.NewStatsHandler(gameRepo)
 
+	limiter := telemetry.NewTokenBucketLimiter(10.0, 20.0, 1*time.Hour)
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ws/connect", wsHandler.ServeConnect)
-	statsHandler.Register(mux)
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/ws/connect", limiter.RateLimitMiddleware(http.HandlerFunc(wsHandler.ServeConnect)))
+
+	apiMux := http.NewServeMux()
+	statsHandler.Register(apiMux)
+	mux.Handle("/api/", limiter.RateLimitMiddleware(apiMux))
 
 	httpAddr := os.Getenv("HTTP_ADDR")
 	if httpAddr == "" {
@@ -93,29 +113,70 @@ func main() {
 
 	httpServer := &http.Server{
 		Addr:              httpAddr,
-		Handler:           mux,
+		Handler:           telemetry.TraceMiddleware(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	go func() {
-		log.Printf("WebSocket endpoint listening on %s/ws/connect", httpAddr)
+		logger.Info("HTTP server listening",
+			slog.String("addr", httpAddr),
+			slog.String("ws_endpoint", httpAddr+"/ws/connect"),
+			slog.String("metrics_endpoint", httpAddr+"/metrics"),
+		)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("CRITICAL: HTTP server failed: %v", err)
+			logger.Error("HTTP server failed", slog.Any("error", err))
+			os.Exit(1)
 		}
 	}()
 
 	// 8. Keep the server alive and listen for termination signals
-	log.Println("Domino JC Game Server is fully operational and running...")
+	logger.Info("Domino JC game server is operational")
 
 	shutdownChan := make(chan os.Signal, 1)
 	signal.Notify(shutdownChan, os.Interrupt, syscall.SIGTERM)
 
 	sig := <-shutdownChan
-	log.Printf("Captured system signal (%v). Initiating safe teardown sequence...", sig)
+	logger.Info("captured shutdown signal, initiating teardown", slog.String("signal", sig.String()))
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		log.Printf("Warning: HTTP server shutdown error: %v", err)
+		logger.Warn("HTTP server shutdown error", slog.Any("error", err))
+	}
+}
+
+func newBreakerWithMetrics(name string) *resilience.Breaker {
+	cfg := resilience.DefaultBreakerConfig(name)
+	cfg.OnStateChange = func(workerName string, _, to gobreaker.State) {
+		telemetry.CircuitBreakerState.WithLabelValues(workerName).Set(gobreakerStateToMetric(to))
+	}
+	breaker := resilience.NewBreaker(cfg)
+	telemetry.CircuitBreakerState.WithLabelValues(name).Set(resilienceStateToMetric(breaker.State()))
+	return breaker
+}
+
+func resilienceStateToMetric(s resilience.State) float64 {
+	switch s {
+	case resilience.StateClosed:
+		return 0
+	case resilience.StateHalfOpen:
+		return 1
+	case resilience.StateOpen:
+		return 2
+	default:
+		return -1
+	}
+}
+
+func gobreakerStateToMetric(s gobreaker.State) float64 {
+	switch s {
+	case gobreaker.StateClosed:
+		return 0
+	case gobreaker.StateHalfOpen:
+		return 1
+	case gobreaker.StateOpen:
+		return 2
+	default:
+		return -1
 	}
 }
