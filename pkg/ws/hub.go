@@ -34,6 +34,20 @@ type statsBroadcastEvent struct {
 	updates   []models.PlayerStatsUpdate
 }
 
+// SessionDelta carries verified post-consensus state for gateway fan-out.
+type SessionDelta struct {
+	MatchID string
+	Op      string
+	Applied bool
+	Session json.RawMessage
+	Turn    json.RawMessage
+}
+
+// sessionBroadcastEvent carries verified consensus deltas for match fan-out.
+type sessionBroadcastEvent struct {
+	delta SessionDelta
+}
+
 // playerConnection tracks connection lifecycle independent of the live socket.
 type playerConnection struct {
 	status ConnectionStatus
@@ -52,8 +66,9 @@ type Hub struct {
 	register   chan *Client
 	unregister chan *Client
 	inbound    chan *InboundMessage
-	abandon    chan abandonmentEvent
-	stats      chan statsBroadcastEvent
+	abandon   chan abandonmentEvent
+	stats     chan statsBroadcastEvent
+	broadcast chan sessionBroadcastEvent
 
 	// pendingStats buffers final rating payloads for disconnected players.
 	pendingStats map[string]map[string][][]byte
@@ -83,7 +98,8 @@ func WithMatchLedger(ledger MatchLedger) HubOption {
 	}
 }
 
-// SetMatchLedger attaches the ledger worker after hub construction (breaks init cycles).
+// SetMatchLedger attaches the ledger worker consumed by async match.ended workers.
+// It is no longer invoked from the hot game loop; background workers call TerminateMatch.
 func (h *Hub) SetMatchLedger(ledger MatchLedger) {
 	h.ledger = ledger
 }
@@ -101,6 +117,7 @@ func NewHub(actions GameActionHandler, opts ...HubOption) *Hub {
 		inbound:              make(chan *InboundMessage, 256),
 		abandon:              make(chan abandonmentEvent, 64),
 		stats:                make(chan statsBroadcastEvent, 256),
+		broadcast:            make(chan sessionBroadcastEvent, 256),
 		actions:              actions,
 		reconnectGracePeriod: reconnectGracePeriod,
 	}
@@ -132,8 +149,61 @@ func (h *Hub) Run() {
 
 		case evt := <-h.stats:
 			h.handleStatsBroadcast(evt)
+
+		case evt := <-h.broadcast:
+			h.handleSessionBroadcast(evt)
 		}
 	}
+}
+
+// NotifySessionDelta enqueues a verified consensus delta for match fan-out.
+func (h *Hub) NotifySessionDelta(delta SessionDelta) {
+	if delta.MatchID == "" {
+		return
+	}
+	select {
+	case h.broadcast <- sessionBroadcastEvent{delta: delta}:
+	default:
+		log.Printf("ws: session broadcast channel full match=%s", delta.MatchID)
+	}
+}
+
+func (h *Hub) handleSessionBroadcast(evt sessionBroadcastEvent) {
+	payload, err := json.Marshal(SessionDeltaPayload{
+		SessionID: evt.delta.MatchID,
+		MatchID:   evt.delta.MatchID,
+		Op:        evt.delta.Op,
+		Applied:   evt.delta.Applied,
+		Session:   evt.delta.Session,
+		Turn:      evt.delta.Turn,
+	})
+	if err != nil {
+		log.Printf("ws: failed to marshal session delta match=%s: %v", evt.delta.MatchID, err)
+		return
+	}
+
+	envelope, err := json.Marshal(EventEnvelope{
+		Type:      EventTypeSessionDelta,
+		Timestamp: time.Now().UnixMilli(),
+		Payload:   payload,
+	})
+	if err != nil {
+		log.Printf("ws: failed to marshal session delta envelope match=%s: %v", evt.delta.MatchID, err)
+		return
+	}
+
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	players, ok := h.clients[evt.delta.MatchID]
+	if !ok || len(players) == 0 {
+		return
+	}
+
+	for playerID := range players {
+		h.sendToPlayerLocked(evt.delta.MatchID, playerID, envelope)
+	}
+	log.Printf("ws: broadcast session delta match=%s clients=%d op=%s", evt.delta.MatchID, len(players), evt.delta.Op)
 }
 
 func (h *Hub) registerClient(client *Client) {
@@ -361,7 +431,8 @@ func (h *Hub) PlayerConnectionStatus(sessionID, playerID string) ConnectionStatu
 }
 
 // TerminateMatch broadcasts the final match frame to all connected peers and
-// enqueues an immutable snapshot for the ledger worker.
+// enqueues an immutable snapshot for the ledger worker. Called from async
+// match.ended consumers, not from the hot game loop.
 func (h *Hub) TerminateMatch(_ context.Context, sessionID string, outcome *models.MatchOutcome, session *models.GameSession) {
 	if outcome == nil || session == nil {
 		log.Printf("ws: TerminateMatch skipped session=%s (missing outcome or session)", sessionID)
@@ -553,6 +624,11 @@ func (h *Hub) PendingStatsCount(sessionID, playerID string) int {
 		return 0
 	}
 	return len(sessionPending[playerID])
+}
+
+// DeliverInboundForTest injects a validated inbound payload into the hub loop.
+func (h *Hub) DeliverInboundForTest(msg *InboundMessage) {
+	h.inbound <- msg
 }
 
 // RegisterTestClient registers a synthetic client for integration tests.

@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"domino_jc_project/pkg/consensus"
 	"domino_jc_project/pkg/repository"
 )
 
@@ -139,4 +140,102 @@ func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
 
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
+}
+
+// GatewayHandler exposes cluster leadership and session routing metadata for gateways.
+type GatewayHandler struct {
+	raft *consensus.RaftNode
+}
+
+// NewGatewayHandler constructs HTTP handlers for gateway failover and routing.
+func NewGatewayHandler(raft *consensus.RaftNode) *GatewayHandler {
+	return &GatewayHandler{raft: raft}
+}
+
+// Register mounts gateway orchestration routes on the provided mux.
+func (h *GatewayHandler) Register(mux *http.ServeMux) {
+	mux.HandleFunc("/api/gateway/leader", h.handleLeader)
+	mux.HandleFunc("/api/gateway/session", h.handleSessionRoute)
+}
+
+func (h *GatewayHandler) handleLeader(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if h.raft == nil {
+		writeError(w, http.StatusServiceUnavailable, "raft node is not configured")
+		return
+	}
+
+	leaderID, leaderAddress, err := h.raft.LeaderEndpoint()
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"error":   err.Error(),
+			"node_id": h.raft.NodeID,
+			"state":   gatewayNodeState(h.raft),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"node_id":         h.raft.NodeID,
+		"leader_id":       leaderID,
+		"leader_address":  leaderAddress,
+		"is_local_leader": leaderID == h.raft.NodeID,
+		"state":           gatewayNodeState(h.raft),
+	})
+}
+
+func (h *GatewayHandler) handleSessionRoute(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if h.raft == nil {
+		writeError(w, http.StatusServiceUnavailable, "raft node is not configured")
+		return
+	}
+
+	sessionID := r.URL.Query().Get("session_id")
+	if sessionID == "" {
+		writeError(w, http.StatusBadRequest, "session_id is required")
+		return
+	}
+
+	leaderID, leaderAddress, err := h.raft.LeaderEndpoint()
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"error":      err.Error(),
+			"session_id": sessionID,
+			"node_id":    h.raft.NodeID,
+			"redirect":   false,
+		})
+		return
+	}
+
+	redirectRequired := leaderID != h.raft.NodeID
+	status := http.StatusOK
+	if redirectRequired {
+		status = http.StatusTemporaryRedirect
+	}
+
+	writeJSON(w, status, map[string]interface{}{
+		"session_id":       sessionID,
+		"node_id":          h.raft.NodeID,
+		"leader_id":        leaderID,
+		"leader_address":   leaderAddress,
+		"redirect":         redirectRequired,
+		"mutations_target": leaderAddress,
+	})
+}
+
+func gatewayNodeState(raft *consensus.RaftNode) string {
+	if raft == nil {
+		return ""
+	}
+	if raft.IsLeader() {
+		return consensus.StateLeader
+	}
+	return consensus.StateFollower
 }

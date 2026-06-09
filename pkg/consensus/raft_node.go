@@ -2,11 +2,37 @@ package consensus
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sync"
 	"time"
 )
+
+// ErrNotLeader indicates the local node cannot accept replicated proposals.
+var ErrNotLeader = errors.New("not leader")
+
+// LeaderRedirectError carries leader metadata so gateway clients can re-route upstream.
+type LeaderRedirectError struct {
+	LeaderID      string
+	LeaderAddress string
+	Reason        string
+}
+
+func (e *LeaderRedirectError) Error() string {
+	if e == nil {
+		return "leader redirect required"
+	}
+	if e.Reason != "" {
+		return e.Reason
+	}
+	return fmt.Sprintf("redirect to leader %s at %s", e.LeaderID, e.LeaderAddress)
+}
+
+// ApplyNotifier receives confirmed FSM apply results for gateway fan-out.
+type ApplyNotifier func(result ApplyResult)
+
+const defaultProposeTimeout = 2 * time.Second
 
 // Raft role constants.
 const (
@@ -77,6 +103,13 @@ type RaftNode struct {
 	nextIndex  map[string]uint64
 	matchIndex map[string]uint64
 
+	knownLeaderID   string
+	knownLeaderTerm uint64
+
+	applyResults map[uint64]interface{}
+	applyWaiters map[uint64][]chan interface{}
+	applyNotify  ApplyNotifier
+
 	electionReset chan struct{}
 	heartbeatStop chan struct{}
 }
@@ -97,8 +130,22 @@ func NewRaftNode(nodeID string, peers map[string]string, fsm GameFSM) *RaftNode 
 		MatchFSM:        fsm,
 		ElectionTimeout: randomElectionTimeout(),
 		log:             []LogEntry{{Index: 0, Term: 0}},
+		applyResults:    make(map[uint64]interface{}),
+		applyWaiters:    make(map[uint64][]chan interface{}),
 		electionReset:   make(chan struct{}, 1),
 	}
+}
+
+// Start launches the background election ticker loop for the node.
+func (n *RaftNode) Start(ctx context.Context) {
+	go n.runElectionTicker(ctx)
+}
+
+// SetApplyNotifier registers a callback invoked after each committed FSM apply.
+func (n *RaftNode) SetApplyNotifier(notifier ApplyNotifier) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.applyNotify = notifier
 }
 
 // RequestVote handles incoming vote requests during leader election.
@@ -157,6 +204,8 @@ func (n *RaftNode) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesRep
 		n.CurrentTerm = args.Term
 		n.VotedFor = ""
 	}
+	n.knownLeaderID = args.LeaderID
+	n.knownLeaderTerm = args.Term
 
 	if args.PrevLogIndex >= uint64(len(n.log)) {
 		reply.Term = n.CurrentTerm
@@ -463,8 +512,12 @@ func (n *RaftNode) advanceCommitIndexLocked() {
 func (n *RaftNode) Propose(command []byte) (uint64, error) {
 	n.mu.Lock()
 	if n.State != StateLeader {
+		redirect := n.leaderRedirectLocked()
 		n.mu.Unlock()
-		return 0, fmt.Errorf("not leader")
+		if redirect != nil {
+			return 0, redirect
+		}
+		return 0, ErrNotLeader
 	}
 
 	index := n.lastLogIndexLocked() + 1
@@ -478,6 +531,115 @@ func (n *RaftNode) Propose(command []byte) (uint64, error) {
 
 	n.broadcastHeartbeats(term)
 	return index, nil
+}
+
+// ProposeAndWait appends a command on the leader, waits for quorum commit and FSM apply,
+// and returns the deterministic Apply result.
+func (n *RaftNode) ProposeAndWait(command []byte) (interface{}, error) {
+	return n.ProposeAndWaitTimeout(command, defaultProposeTimeout)
+}
+
+// ProposeAndWaitTimeout is ProposeAndWait with an explicit commit/apply deadline.
+func (n *RaftNode) ProposeAndWaitTimeout(command []byte, timeout time.Duration) (interface{}, error) {
+	index, err := n.Propose(command)
+	if err != nil {
+		return nil, err
+	}
+	if err := n.waitForCommit(index, timeout); err != nil {
+		return nil, err
+	}
+	return n.waitForApply(index, timeout)
+}
+
+// LeaderEndpoint returns the current cluster leader identity and routable address.
+func (n *RaftNode) LeaderEndpoint() (leaderID, leaderAddress string, err error) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	if n.State == StateLeader {
+		addr, ok := n.PeerAddresses[n.NodeID]
+		if !ok {
+			return n.NodeID, "", fmt.Errorf("leader address for %q is not configured", n.NodeID)
+		}
+		return n.NodeID, addr, nil
+	}
+
+	if n.knownLeaderID == "" {
+		return "", "", fmt.Errorf("cluster leader is unknown")
+	}
+	addr, ok := n.PeerAddresses[n.knownLeaderID]
+	if !ok {
+		return n.knownLeaderID, "", fmt.Errorf("leader address for %q is not configured", n.knownLeaderID)
+	}
+	return n.knownLeaderID, addr, nil
+}
+
+// IsLeader reports whether this node is the active Raft leader.
+func (n *RaftNode) IsLeader() bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.State == StateLeader
+}
+
+func (n *RaftNode) leaderRedirectLocked() *LeaderRedirectError {
+	if n.State == StateLeader {
+		return nil
+	}
+	leaderID := n.knownLeaderID
+	if leaderID == "" {
+		return &LeaderRedirectError{Reason: "cluster leader is unknown"}
+	}
+	addr, ok := n.PeerAddresses[leaderID]
+	if !ok {
+		return &LeaderRedirectError{
+			LeaderID: leaderID,
+			Reason:   fmt.Sprintf("leader address for %q is not configured", leaderID),
+		}
+	}
+	return &LeaderRedirectError{
+		LeaderID:      leaderID,
+		LeaderAddress: addr,
+		Reason:        "submit in-game actions to the cluster leader",
+	}
+}
+
+func (n *RaftNode) waitForCommit(index uint64, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		n.mu.RLock()
+		committed := n.commitIndex >= index
+		term := n.CurrentTerm
+		n.mu.RUnlock()
+		if committed {
+			return nil
+		}
+		n.broadcastHeartbeats(term)
+		time.Sleep(10 * time.Millisecond)
+	}
+	return fmt.Errorf("timed out waiting for commit at index %d", index)
+}
+
+func (n *RaftNode) waitForApply(index uint64, timeout time.Duration) (interface{}, error) {
+	waiter := make(chan interface{}, 1)
+
+	n.mu.Lock()
+	if result, ok := n.applyResults[index]; ok {
+		n.mu.Unlock()
+		return result, nil
+	}
+	n.applyWaiters[index] = append(n.applyWaiters[index], waiter)
+	n.mu.Unlock()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case result := <-waiter:
+		return result, nil
+	case <-timer.C:
+		return nil, fmt.Errorf("timed out waiting for replicated apply at index %d", index)
+	}
 }
 
 // ReadLinearizableState confirms leadership with a quorum, then reads from the local GameFSM.
@@ -644,6 +806,32 @@ func (n *RaftNode) entriesFromArgs(args AppendEntriesArgs) []LogEntry {
 func (n *RaftNode) applyCommittedLocked() {
 	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
-		n.MatchFSM.Apply(n.log[n.lastApplied].Command)
+		index := n.lastApplied
+		result := n.MatchFSM.Apply(n.log[index].Command)
+		n.recordApplyResultLocked(index, result)
+		n.dispatchApplyNotification(result)
 	}
+}
+
+func (n *RaftNode) recordApplyResultLocked(index uint64, result interface{}) {
+	n.applyResults[index] = result
+	waiters := n.applyWaiters[index]
+	delete(n.applyWaiters, index)
+	for _, waiter := range waiters {
+		select {
+		case waiter <- result:
+		default:
+		}
+	}
+}
+
+func (n *RaftNode) dispatchApplyNotification(result interface{}) {
+	if n.applyNotify == nil {
+		return
+	}
+	applyResult, ok := AsApplyResult(result)
+	if !ok || !applyResult.OK {
+		return
+	}
+	n.applyNotify(applyResult)
 }
