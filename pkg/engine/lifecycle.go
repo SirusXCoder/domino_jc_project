@@ -3,22 +3,14 @@ package engine
 import (
 	"context"
 	"fmt"
+	"log"
 
+	"domino_jc_project/pkg/game"
 	"domino_jc_project/pkg/models"
 )
 
-// MatchTerminator broadcasts final match frames and enqueues immutable ledger snapshots.
-type MatchTerminator interface {
-	TerminateMatch(ctx context.Context, sessionID string, outcome *models.MatchOutcome, session *models.GameSession)
-}
-
-// SetMatchTerminator wires the WebSocket hub (or test double) for match completion fan-out.
-func (m *GameManager) SetMatchTerminator(terminator MatchTerminator) {
-	m.matchTerminator = terminator
-}
-
 // processGameTurn runs ProcessGameTurn under the session mutex, applies conditional
-// gRPC upsert checks, and triggers match termination when evaluation succeeds.
+// gRPC upsert checks, and publishes integration events without blocking on consumers.
 func (m *GameManager) processGameTurn(
 	ctx context.Context,
 	sessionID string,
@@ -49,6 +41,7 @@ func (m *GameManager) processGameTurn(
 		}
 	}
 
+	m.publishTurnEvents(ctx, entry.session, result)
 	return result, nil
 }
 
@@ -84,13 +77,27 @@ func (m *GameManager) finalizeMatchLocked(
 		return fmt.Errorf("persist completed session %q: %w", sessionID, err)
 	}
 
-	if m.matchTerminator != nil {
-		m.matchTerminator.TerminateMatch(ctx, sessionID, outcome, session)
-	}
-
 	return nil
 }
-// terminates the match when evaluation succeeds.
+
+func (m *GameManager) publishTurnEvents(
+	ctx context.Context,
+	session *models.GameSession,
+	result *models.TurnResult,
+) {
+	if m.gameEngine == nil {
+		return
+	}
+	if err := m.gameEngine.Tick(ctx, game.TickRequest{
+		Session: session,
+		Result:  result,
+	}); err != nil {
+		log.Printf("game engine publish: %v", err)
+	}
+}
+
+// evaluateAndMaybeFinalize re-evaluates match completion and publishes broker events
+// when a terminal state is reached outside the normal turn pipeline.
 func (m *GameManager) evaluateAndMaybeFinalize(ctx context.Context, sessionID string) error {
 	entry, err := m.lookupSession(ctx, sessionID)
 	if err != nil {
@@ -109,5 +116,13 @@ func (m *GameManager) evaluateAndMaybeFinalize(ctx context.Context, sessionID st
 		return nil
 	}
 
-	return m.finalizeMatchLocked(ctx, sessionID, entry.session, outcome)
+	if err := m.finalizeMatchLocked(ctx, sessionID, entry.session, outcome); err != nil {
+		return err
+	}
+
+	m.publishTurnEvents(ctx, entry.session, &models.TurnResult{
+		MatchEnded: true,
+		Outcome:    outcome,
+	})
+	return nil
 }

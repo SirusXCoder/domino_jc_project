@@ -2,6 +2,7 @@ package ws
 
 import (
 	"encoding/json"
+	"errors"
 	"time"
 
 	"domino_jc_project/pkg/models"
@@ -18,7 +19,8 @@ const (
 	EventTypeStateSnapshot    = "STATE_SNAPSHOT"
 	EventTypeMatchEnd         = "MATCH_END"
 	EventTypePlayerStatsUpdated = "PLAYER_STATS_UPDATED"
-	EventTypeError            = "ERROR"
+	EventTypeSessionDelta       = "SESSION_DELTA"
+	EventTypeError              = "ERROR"
 )
 
 // ConnectionStatus tracks a player's socket lifecycle within the hub.
@@ -43,6 +45,8 @@ const (
 	ErrCodeMoveRejected     = "MOVE_REJECTED"
 	ErrCodeSessionLocked    = "SESSION_LOCKED"
 	ErrCodeNotImplemented   = "ACTION_NOT_SUPPORTED"
+	ErrCodeLeaderRedirect   = "LEADER_REDIRECT"
+	ErrCodeEvaluationFailed = "EVALUATION_FAILED"
 )
 
 // EventEnvelope is the standard inbound/outbound message wrapper.
@@ -52,12 +56,29 @@ type EventEnvelope struct {
 	Payload   json.RawMessage `json:"payload"`
 }
 
+// RedirectMetadata tells a gateway client where to re-route session mutations.
+type RedirectMetadata struct {
+	LeaderID      string `json:"leader_id"`
+	LeaderAddress string `json:"leader_address"`
+}
+
 // ErrorEnvelope is sent to a client when an inbound event cannot be processed.
 type ErrorEnvelope struct {
-	Type      string `json:"type"`
-	Timestamp int64  `json:"timestamp"`
-	Error     string `json:"error"`
-	Message   string `json:"message,omitempty"`
+	Type      string            `json:"type"`
+	Timestamp int64             `json:"timestamp"`
+	Error     string            `json:"error"`
+	Message   string            `json:"message,omitempty"`
+	Redirect  *RedirectMetadata `json:"redirect,omitempty"`
+}
+
+// SessionDeltaPayload streams a verified post-consensus state change to connected peers.
+type SessionDeltaPayload struct {
+	SessionID string          `json:"session_id"`
+	MatchID   string          `json:"match_id"`
+	Op        string          `json:"op"`
+	Applied   bool            `json:"applied,omitempty"`
+	Session   json.RawMessage `json:"session,omitempty"`
+	Turn      json.RawMessage `json:"turn,omitempty"`
 }
 
 // MovePayload carries coordinate hints and tile selection for PLAYER_MOVE.
@@ -131,6 +152,45 @@ func newErrorEnvelope(code, message string) ([]byte, error) {
 		Timestamp: time.Now().UnixMilli(),
 		Error:     code,
 		Message:   message,
+	}
+	return json.Marshal(env)
+}
+
+// RedirectableError carries leader metadata through the game action handler surface.
+type RedirectableError struct {
+	Metadata RedirectMetadata
+	Message  string
+}
+
+func (e *RedirectableError) Error() string {
+	if e == nil {
+		return "leader redirect required"
+	}
+	if e.Message != "" {
+		return e.Message
+	}
+	return "leader redirect required"
+}
+
+// AsLeaderRedirect extracts gateway redirect metadata from a handler error.
+func AsLeaderRedirect(err error) (RedirectMetadata, bool) {
+	var redirect *RedirectableError
+	if !errors.As(err, &redirect) || redirect == nil {
+		return RedirectMetadata{}, false
+	}
+	if redirect.Metadata.LeaderID == "" || redirect.Metadata.LeaderAddress == "" {
+		return RedirectMetadata{}, false
+	}
+	return redirect.Metadata, true
+}
+
+func newRedirectEnvelope(redirect RedirectMetadata, message string) ([]byte, error) {
+	env := ErrorEnvelope{
+		Type:      EventTypeError,
+		Timestamp: time.Now().UnixMilli(),
+		Error:     ErrCodeLeaderRedirect,
+		Message:   message,
+		Redirect:  &redirect,
 	}
 	return json.Marshal(env)
 }

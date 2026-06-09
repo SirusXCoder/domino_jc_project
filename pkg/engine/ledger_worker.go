@@ -18,6 +18,8 @@ type MatchRatingProcessor interface {
 }
 
 // LedgerWorker asynchronously persists immutable MatchRecord snapshots to Dgraph.
+// Records are enqueued by async match.ended consumers (via the WebSocket hub),
+// not from the hot game loop.
 type LedgerWorker struct {
 	repo    repository.MatchLedgerRepository
 	ratings MatchRatingProcessor

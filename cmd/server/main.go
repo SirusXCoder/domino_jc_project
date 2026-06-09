@@ -13,8 +13,10 @@ import (
 	"github.com/sony/gobreaker"
 
 	"domino_jc_project/pkg/api"
+	"domino_jc_project/pkg/broker"
 	"domino_jc_project/pkg/database"
 	"domino_jc_project/pkg/engine"
+	"domino_jc_project/pkg/game"
 	"domino_jc_project/pkg/repository"
 	"domino_jc_project/pkg/resilience"
 	"domino_jc_project/pkg/telemetry"
@@ -72,7 +74,13 @@ func main() {
 	}
 	logger.Info("game repository layer and orchestrator initialized")
 
-	// 7. Start the WebSocket hub with bidirectional event routing into GameManager.
+	// 7. Event broker and async consumer workers (ledger, ratings, WS fan-out).
+	eventBroker := broker.NewInMemoryBroker()
+	defer eventBroker.Close()
+
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	defer workerCancel()
+
 	ledgerBreaker := newBreakerWithMetrics("ledger")
 	ratingBreaker := newBreakerWithMetrics("rating")
 
@@ -89,9 +97,28 @@ func main() {
 		engine.WithLedgerBreaker(ledgerBreaker),
 	)
 	hub.SetMatchLedger(ledgerWorker)
-	gameManager.SetMatchTerminator(hub)
-	go hub.Run()
 	go ledgerWorker.Run()
+
+	go func() {
+		if err := game.StartBackgroundWorkersWithConfig(workerCtx, eventBroker, game.WorkerConfig{
+			OnMatchEnded: func(ctx context.Context, payload game.MatchEndedPayload) {
+				if payload.Outcome == nil || payload.Session == nil {
+					logger.Warn("match.ended event missing outcome or session",
+						slog.String("session_id", payload.SessionID),
+					)
+					return
+				}
+				hub.TerminateMatch(ctx, payload.SessionID, payload.Outcome, payload.Session)
+			},
+		}); err != nil {
+			logger.Error("failed to start background event workers", slog.Any("error", err))
+		}
+	}()
+
+	gameEngine := game.NewGameEngine(eventBroker)
+	gameManager.SetGameEngine(gameEngine)
+
+	go hub.Run()
 
 	wsHandler := ws.NewHandler(hub)
 	statsHandler := api.NewStatsHandler(gameRepo)
@@ -137,6 +164,9 @@ func main() {
 
 	sig := <-shutdownChan
 	logger.Info("captured shutdown signal, initiating teardown", slog.String("signal", sig.String()))
+
+	workerCancel()
+	ledgerWorker.Stop()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

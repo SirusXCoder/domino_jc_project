@@ -97,7 +97,7 @@ func (r *EventRouter) handlePlayerMove(ctx context.Context, msg *InboundMessage,
 
 	if _, err := r.actions.ApplyPlayTile(ctx, payload.SessionID, payload.PlayerID, tile, payload.PlayAtLeft); err != nil {
 		code, message := mapActionError(err)
-		r.sendError(msg.SessionID, msg.PlayerID, code, message)
+		r.sendActionError(msg.SessionID, msg.PlayerID, code, message, err)
 	}
 }
 
@@ -120,7 +120,7 @@ func (r *EventRouter) handlePlayTile(ctx context.Context, msg *InboundMessage, r
 
 	if _, err := r.actions.ApplyPlayTile(ctx, payload.SessionID, payload.PlayerID, payload.Tile, payload.PlayAtLeft); err != nil {
 		code, message := mapActionError(err)
-		r.sendError(msg.SessionID, msg.PlayerID, code, message)
+		r.sendActionError(msg.SessionID, msg.PlayerID, code, message, err)
 	}
 }
 
@@ -138,7 +138,7 @@ func (r *EventRouter) handleDrawFromBoneyard(ctx context.Context, msg *InboundMe
 
 	if _, err := r.actions.ApplyDrawFromBoneyard(ctx, payload.SessionID, payload.PlayerID); err != nil {
 		code, message := mapActionError(err)
-		r.sendError(msg.SessionID, msg.PlayerID, code, message)
+		r.sendActionError(msg.SessionID, msg.PlayerID, code, message, err)
 	}
 }
 
@@ -156,7 +156,7 @@ func (r *EventRouter) handlePassTurn(ctx context.Context, msg *InboundMessage, r
 
 	if err := r.actions.ApplyPassTurn(ctx, payload.SessionID, payload.PlayerID); err != nil {
 		code, message := mapActionError(err)
-		r.sendError(msg.SessionID, msg.PlayerID, code, message)
+		r.sendActionError(msg.SessionID, msg.PlayerID, code, message, err)
 	}
 }
 
@@ -265,19 +265,37 @@ func isSessionNotFound(err error) bool {
 }
 
 func mapActionError(err error) (code, message string) {
+	if redirect, ok := AsLeaderRedirect(err); ok {
+		_ = redirect
+		return ErrCodeLeaderRedirect, err.Error()
+	}
 	if errors.Is(err, models.ErrMutationsLocked) {
 		return ErrCodeSessionLocked, err.Error()
 	}
 	if isSessionNotFound(err) {
 		return ErrCodeSessionNotFound, err.Error()
 	}
+	if strings.Contains(err.Error(), "timed out waiting for replicated apply") {
+		return ErrCodeEvaluationFailed, err.Error()
+	}
 	return ErrCodeMoveRejected, err.Error()
 }
 
 func (r *EventRouter) sendError(sessionID, playerID, code, message string) {
-	payload, err := newErrorEnvelope(code, message)
-	if err != nil {
-		log.Printf("ws: failed to marshal error envelope session=%s player=%s: %v", sessionID, playerID, err)
+	r.sendActionError(sessionID, playerID, code, message, nil)
+}
+
+func (r *EventRouter) sendActionError(sessionID, playerID, code, message string, err error) {
+	var payload []byte
+	var marshalErr error
+
+	if redirect, ok := AsLeaderRedirect(err); ok {
+		payload, marshalErr = newRedirectEnvelope(redirect, message)
+	} else {
+		payload, marshalErr = newErrorEnvelope(code, message)
+	}
+	if marshalErr != nil {
+		log.Printf("ws: failed to marshal error envelope session=%s player=%s: %v", sessionID, playerID, marshalErr)
 		return
 	}
 	r.hub.sendToPlayer(sessionID, playerID, payload)

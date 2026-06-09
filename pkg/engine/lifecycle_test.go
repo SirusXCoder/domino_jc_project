@@ -3,36 +3,17 @@ package engine
 import (
 	"context"
 	"testing"
+	"time"
 
+	"domino_jc_project/pkg/broker"
+	"domino_jc_project/pkg/game"
 	"domino_jc_project/pkg/models"
 )
-
-type memoryLedgerRepo struct {
-	records []models.MatchRecord
-}
-
-func (m *memoryLedgerRepo) SaveMatchRecord(_ context.Context, record models.MatchRecord) error {
-	m.records = append(m.records, record)
-	return nil
-}
-
-type stubTerminator struct {
-	calls []terminateCall
-}
-
-type terminateCall struct {
-	sessionID string
-	outcome   *models.MatchOutcome
-}
-
-func (s *stubTerminator) TerminateMatch(_ context.Context, sessionID string, outcome *models.MatchOutcome, _ *models.GameSession) {
-	s.calls = append(s.calls, terminateCall{sessionID: sessionID, outcome: outcome})
-}
 
 func TestProcessGameTurn_PersistsActiveMutation(t *testing.T) {
 	repo := &trackingRepo{}
 	manager := NewGameManager(repo)
-	manager.SetMatchTerminator(&stubTerminator{})
+	manager.SetGameEngine(game.NewGameEngine(broker.NewInMemoryBroker()))
 
 	session := models.NewGameSession("s1", []string{"p1", "p2"})
 	session.GenerateStandardDeck()
@@ -82,12 +63,19 @@ func TestProcessGameTurn_RejectsLockedSession(t *testing.T) {
 	}
 }
 
-func TestProcessGameTurn_EmptyHandTerminatesMatch(t *testing.T) {
+func TestProcessGameTurn_EmptyHandPublishesMatchEnded(t *testing.T) {
 	repo := &trackingRepo{}
-	terminator := &stubTerminator{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b := broker.NewInMemoryBroker()
+	matchEndedCh, err := b.Subscribe(ctx, game.TopicMatchEnded)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
 
 	manager := NewGameManager(repo)
-	manager.SetMatchTerminator(terminator)
+	manager.SetGameEngine(game.NewGameEngine(b))
 
 	session := models.NewGameSession("s1", []string{"p1", "p2"})
 	session.Status = models.SessionStatusActive
@@ -113,8 +101,18 @@ func TestProcessGameTurn_EmptyHandTerminatesMatch(t *testing.T) {
 	if result.Outcome.WinnerID != "p1" {
 		t.Fatalf("winner = %q, want p1", result.Outcome.WinnerID)
 	}
-	if len(terminator.calls) != 1 {
-		t.Fatalf("terminator calls = %d, want 1", len(terminator.calls))
+
+	select {
+	case evt := <-matchEndedCh:
+		payload, ok := evt.Payload.(game.MatchEndedPayload)
+		if !ok {
+			t.Fatalf("payload type = %T, want MatchEndedPayload", evt.Payload)
+		}
+		if payload.SessionID != "s1" {
+			t.Fatalf("session_id = %q, want s1", payload.SessionID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for match.ended event")
 	}
 
 	loaded, ok := manager.GetSession(context.Background(), "s1")
