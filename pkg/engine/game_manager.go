@@ -6,6 +6,7 @@ import (
 	"log"
 	"sync"
 
+	"domino_jc_project/pkg/game"
 	"domino_jc_project/pkg/models"
 	"domino_jc_project/pkg/repository"
 )
@@ -21,22 +22,29 @@ type sessionEntry struct {
 // persistence through the injected GameRepository.
 type GameManager struct {
 	// Map mutex: only held during map reads/writes, never during long DB operations.
-	mu           sync.RWMutex
-	sessions     map[string]*sessionEntry
-	recoveredIDs map[string]bool
-	hydrating    map[string]*sync.WaitGroup
-	repo         repository.GameRepository
+	mu             sync.RWMutex
+	sessions       map[string]*sessionEntry
+	recoveredIDs   map[string]bool
+	hydrating      map[string]*sync.WaitGroup
+	ledgerProfiles map[string]models.PlayerStatsUpdate
+	repo           repository.GameRepository
 
-	matchTerminator MatchTerminator
+	gameEngine *game.GameEngine
+}
+
+// SetGameEngine wires the broker-backed integration layer used by the hot game loop.
+func (m *GameManager) SetGameEngine(engine *game.GameEngine) {
+	m.gameEngine = engine
 }
 
 // NewGameManager constructs a GameManager backed by the given repository.
 func NewGameManager(repo repository.GameRepository) *GameManager {
 	return &GameManager{
-		sessions:     make(map[string]*sessionEntry),
-		recoveredIDs: make(map[string]bool),
-		hydrating:    make(map[string]*sync.WaitGroup),
-		repo:         repo,
+		sessions:       make(map[string]*sessionEntry),
+		recoveredIDs:   make(map[string]bool),
+		hydrating:      make(map[string]*sync.WaitGroup),
+		ledgerProfiles: make(map[string]models.PlayerStatsUpdate),
+		repo:           repo,
 	}
 }
 
