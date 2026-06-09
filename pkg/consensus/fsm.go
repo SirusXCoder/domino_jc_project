@@ -1,7 +1,10 @@
 package consensus
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -9,6 +12,19 @@ import (
 	"domino_jc_project/pkg/engine"
 	"domino_jc_project/pkg/models"
 )
+
+const (
+	fsmSnapshotMagic   uint32 = 0x4746534D // "GFSM"
+	fsmSnapshotVersion uint8  = 1
+)
+
+func init() {
+	gob.Register(managedFSMSnapshot{})
+	gob.Register(map[string]*models.GameSession{})
+	gob.Register(map[string]models.PlayerStatsUpdate{})
+	gob.Register(&models.GameSession{})
+	gob.Register(models.PlayerStatsUpdate{})
+}
 
 // Command is a replicated log entry payload executed deterministically by every node.
 type Command struct {
@@ -21,6 +37,8 @@ type Command struct {
 type GameFSM interface {
 	// Apply executes a committed command against local in-memory game state.
 	Apply(logEntry []byte) interface{}
+	// CreateSnapshot serializes active match memory into a minimized binary payload.
+	CreateSnapshot() ([]byte, error)
 	// Snapshot serializes active match memory for log compaction.
 	Snapshot() ([]byte, error)
 	// Restore rebuilds game state from a snapshot during bootstrap or sync.
@@ -92,30 +110,30 @@ func (f *LocalGameFSM) Apply(logEntry []byte) interface{} {
 	}
 }
 
-// Snapshot serializes the current match map for Raft log compaction.
-func (f *LocalGameFSM) Snapshot() ([]byte, error) {
+// CreateSnapshot serializes the current match map into a minimized binary payload.
+func (f *LocalGameFSM) CreateSnapshot() ([]byte, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
+	return encodeLocalFSMSnapshot(f.matches)
+}
 
-	snap := fsmSnapshot{Matches: make(map[string]matchState, len(f.matches))}
-	for id, state := range f.matches {
-		snap.Matches[id] = state
-	}
-	return json.Marshal(snap)
+// Snapshot serializes the current match map for Raft log compaction.
+func (f *LocalGameFSM) Snapshot() ([]byte, error) {
+	return f.CreateSnapshot()
 }
 
 // Restore replaces local state from a snapshot produced by Snapshot.
 func (f *LocalGameFSM) Restore(snapshot []byte) error {
-	var snap fsmSnapshot
-	if err := json.Unmarshal(snapshot, &snap); err != nil {
-		return fmt.Errorf("decode snapshot: %w", err)
+	matches, err := decodeLocalFSMSnapshot(snapshot)
+	if err != nil {
+		return err
 	}
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.matches = make(map[string]matchState, len(snap.Matches))
-	for id, state := range snap.Matches {
+	f.matches = make(map[string]matchState, len(matches))
+	for id, state := range matches {
 		f.matches[id] = state
 	}
 	return nil
@@ -217,20 +235,25 @@ func (f *ManagedGameFSM) Apply(logEntry []byte) interface{} {
 	}
 }
 
-// Snapshot serializes active sessions and ledger profile cache for compaction.
-func (f *ManagedGameFSM) Snapshot() ([]byte, error) {
+// CreateSnapshot serializes active sessions and ledger profile cache for compaction.
+func (f *ManagedGameFSM) CreateSnapshot() ([]byte, error) {
 	snap := managedFSMSnapshot{
 		Sessions: f.manager.SnapshotSessions(),
 		Ledger:   f.manager.LedgerProfiles(),
 	}
-	return json.Marshal(snap)
+	return encodeManagedFSMSnapshot(snap)
+}
+
+// Snapshot serializes active sessions and ledger profile cache for compaction.
+func (f *ManagedGameFSM) Snapshot() ([]byte, error) {
+	return f.CreateSnapshot()
 }
 
 // Restore rebuilds GameManager state from a snapshot.
 func (f *ManagedGameFSM) Restore(snapshot []byte) error {
-	var snap managedFSMSnapshot
-	if err := json.Unmarshal(snapshot, &snap); err != nil {
-		return fmt.Errorf("decode snapshot: %w", err)
+	snap, err := decodeManagedFSMSnapshot(snapshot)
+	if err != nil {
+		return err
 	}
 	if err := f.manager.RestoreSessions(snap.Sessions); err != nil {
 		return err
@@ -264,6 +287,181 @@ func isApplyError(result interface{}) bool {
 // IsApplyError reports whether Apply returned a structural failure.
 func IsApplyError(result interface{}) bool {
 	return isApplyError(result)
+}
+
+func encodeLocalFSMSnapshot(matches map[string]matchState) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := binary.Write(&buf, binary.BigEndian, fsmSnapshotMagic); err != nil {
+		return nil, err
+	}
+	if err := buf.WriteByte(fsmSnapshotVersion); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(&buf, binary.BigEndian, uint32(len(matches))); err != nil {
+		return nil, err
+	}
+
+	for id, state := range matches {
+		if len(id) > int(^uint16(0)) {
+			return nil, fmt.Errorf("match id %q exceeds maximum encoded length", id)
+		}
+		if err := binary.Write(&buf, binary.BigEndian, uint16(len(id))); err != nil {
+			return nil, err
+		}
+		if _, err := buf.WriteString(id); err != nil {
+			return nil, err
+		}
+		if err := binary.Write(&buf, binary.BigEndian, int32(state.Counter)); err != nil {
+			return nil, err
+		}
+		status := []byte(state.Status)
+		if len(status) > int(^uint16(0)) {
+			return nil, fmt.Errorf("match status for %q exceeds maximum encoded length", id)
+		}
+		if err := binary.Write(&buf, binary.BigEndian, uint16(len(status))); err != nil {
+			return nil, err
+		}
+		if _, err := buf.Write(status); err != nil {
+			return nil, err
+		}
+	}
+	return buf.Bytes(), nil
+}
+
+func decodeLocalFSMSnapshot(snapshot []byte) (map[string]matchState, error) {
+	if len(snapshot) < 9 {
+		return nil, fmt.Errorf("decode snapshot: payload too short")
+	}
+
+	reader := bytes.NewReader(snapshot)
+	var magic uint32
+	if err := binary.Read(reader, binary.BigEndian, &magic); err != nil {
+		return nil, fmt.Errorf("decode snapshot magic: %w", err)
+	}
+	if magic != fsmSnapshotMagic {
+		return nil, fmt.Errorf("decode snapshot: invalid magic")
+	}
+
+	version, err := reader.ReadByte()
+	if err != nil {
+		return nil, fmt.Errorf("decode snapshot version: %w", err)
+	}
+	if version != fsmSnapshotVersion {
+		return nil, fmt.Errorf("decode snapshot: unsupported version %d", version)
+	}
+
+	var count uint32
+	if err := binary.Read(reader, binary.BigEndian, &count); err != nil {
+		return nil, fmt.Errorf("decode snapshot count: %w", err)
+	}
+
+	matches := make(map[string]matchState, count)
+	for i := uint32(0); i < count; i++ {
+		var idLen uint16
+		if err := binary.Read(reader, binary.BigEndian, &idLen); err != nil {
+			return nil, fmt.Errorf("decode snapshot match id length: %w", err)
+		}
+		idBytes := make([]byte, idLen)
+		if _, err := ioReadFull(reader, idBytes); err != nil {
+			return nil, fmt.Errorf("decode snapshot match id: %w", err)
+		}
+
+		var counter int32
+		if err := binary.Read(reader, binary.BigEndian, &counter); err != nil {
+			return nil, fmt.Errorf("decode snapshot counter: %w", err)
+		}
+
+		var statusLen uint16
+		if err := binary.Read(reader, binary.BigEndian, &statusLen); err != nil {
+			return nil, fmt.Errorf("decode snapshot status length: %w", err)
+		}
+		statusBytes := make([]byte, statusLen)
+		if _, err := ioReadFull(reader, statusBytes); err != nil {
+			return nil, fmt.Errorf("decode snapshot status: %w", err)
+		}
+
+		matches[string(idBytes)] = matchState{
+			Counter: int(counter),
+			Status:  string(statusBytes),
+		}
+	}
+	return matches, nil
+}
+
+func encodeManagedFSMSnapshot(snap managedFSMSnapshot) ([]byte, error) {
+	var payload bytes.Buffer
+	encoder := gob.NewEncoder(&payload)
+	if err := encoder.Encode(snap); err != nil {
+		return nil, fmt.Errorf("encode managed snapshot: %w", err)
+	}
+
+	var buf bytes.Buffer
+	if err := binary.Write(&buf, binary.BigEndian, fsmSnapshotMagic); err != nil {
+		return nil, err
+	}
+	if err := buf.WriteByte(fsmSnapshotVersion + 1); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(&buf, binary.BigEndian, uint32(payload.Len())); err != nil {
+		return nil, err
+	}
+	if _, err := buf.Write(payload.Bytes()); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func decodeManagedFSMSnapshot(snapshot []byte) (managedFSMSnapshot, error) {
+	if len(snapshot) < 9 {
+		return managedFSMSnapshot{}, fmt.Errorf("decode snapshot: payload too short")
+	}
+
+	reader := bytes.NewReader(snapshot)
+	var magic uint32
+	if err := binary.Read(reader, binary.BigEndian, &magic); err != nil {
+		return managedFSMSnapshot{}, fmt.Errorf("decode snapshot magic: %w", err)
+	}
+	if magic != fsmSnapshotMagic {
+		return managedFSMSnapshot{}, fmt.Errorf("decode snapshot: invalid magic")
+	}
+
+	version, err := reader.ReadByte()
+	if err != nil {
+		return managedFSMSnapshot{}, fmt.Errorf("decode snapshot version: %w", err)
+	}
+	if version != fsmSnapshotVersion+1 {
+		return managedFSMSnapshot{}, fmt.Errorf("decode snapshot: unsupported version %d", version)
+	}
+
+	var payloadLen uint32
+	if err := binary.Read(reader, binary.BigEndian, &payloadLen); err != nil {
+		return managedFSMSnapshot{}, fmt.Errorf("decode snapshot payload length: %w", err)
+	}
+	payload := make([]byte, payloadLen)
+	if _, err := ioReadFull(reader, payload); err != nil {
+		return managedFSMSnapshot{}, fmt.Errorf("decode snapshot payload: %w", err)
+	}
+
+	var snap managedFSMSnapshot
+	decoder := gob.NewDecoder(bytes.NewReader(payload))
+	if err := decoder.Decode(&snap); err != nil {
+		return managedFSMSnapshot{}, fmt.Errorf("decode managed snapshot: %w", err)
+	}
+	return snap, nil
+}
+
+func ioReadFull(r interface {
+	Read([]byte) (int, error)
+}, buf []byte) (int, error) {
+	total := 0
+	for total < len(buf) {
+		n, err := r.Read(buf[total:])
+		total += n
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
 }
 
 // AsApplyResult extracts a successful ApplyResult when Apply did not fail.

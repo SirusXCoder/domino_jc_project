@@ -7,6 +7,8 @@ import (
 	"math/rand"
 	"sync"
 	"time"
+
+	"domino_jc_project/pkg/database"
 )
 
 // ErrNotLeader indicates the local node cannot accept replicated proposals.
@@ -84,6 +86,22 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
+// InstallSnapshotArgs ships a compacted FSM image to a lagging follower.
+type InstallSnapshotArgs struct {
+	Term              uint64
+	LeaderID          string
+	LastIncludedIndex uint64
+	LastIncludedTerm  uint64
+	Data              []byte
+}
+
+// InstallSnapshotReply is the RPC response for snapshot installation.
+type InstallSnapshotReply struct {
+	Term uint64
+}
+
+const defaultCompactThreshold uint64 = 1000
+
 // RaftNode encapsulates cluster metadata, election state, and the match FSM.
 type RaftNode struct {
 	mu sync.RWMutex
@@ -110,6 +128,12 @@ type RaftNode struct {
 	applyWaiters map[uint64][]chan interface{}
 	applyNotify  ApplyNotifier
 
+	storage          *database.RaftStorage
+	compactThreshold uint64
+	snapshotIndex    uint64
+	snapshotTerm     uint64
+	lastSnapshot     []byte
+
 	electionReset chan struct{}
 	heartbeatStop chan struct{}
 }
@@ -122,18 +146,70 @@ func NewRaftNode(nodeID string, peers map[string]string, fsm GameFSM) *RaftNode 
 	}
 
 	return &RaftNode{
-		NodeID:          nodeID,
-		PeerAddresses:   peerCopy,
-		CurrentTerm:     0,
-		VotedFor:        "",
-		State:           StateFollower,
-		MatchFSM:        fsm,
-		ElectionTimeout: randomElectionTimeout(),
-		log:             []LogEntry{{Index: 0, Term: 0}},
-		applyResults:    make(map[uint64]interface{}),
-		applyWaiters:    make(map[uint64][]chan interface{}),
-		electionReset:   make(chan struct{}, 1),
+		NodeID:           nodeID,
+		PeerAddresses:    peerCopy,
+		CurrentTerm:      0,
+		VotedFor:         "",
+		State:            StateFollower,
+		MatchFSM:         fsm,
+		ElectionTimeout:  randomElectionTimeout(),
+		log:              []LogEntry{{Index: 0, Term: 0}},
+		applyResults:     make(map[uint64]interface{}),
+		applyWaiters:     make(map[uint64][]chan interface{}),
+		compactThreshold: defaultCompactThreshold,
+		electionReset:    make(chan struct{}, 1),
 	}
+}
+
+// NewRaftNodeWithStorage bootstraps a node from durable storage when present.
+func NewRaftNodeWithStorage(nodeID string, peers map[string]string, fsm GameFSM, storage *database.RaftStorage) (*RaftNode, error) {
+	node := NewRaftNode(nodeID, peers, fsm)
+	node.storage = storage
+	if storage == nil {
+		return node, nil
+	}
+	if err := node.bootstrapFromStorage(); err != nil {
+		return nil, err
+	}
+	return node, nil
+}
+
+// SetCompactThreshold configures how many uncompacted log entries trigger compaction.
+func (n *RaftNode) SetCompactThreshold(threshold uint64) {
+	if threshold == 0 {
+		threshold = defaultCompactThreshold
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.compactThreshold = threshold
+}
+
+// SnapshotIndex returns the trailing index of the latest installed snapshot.
+func (n *RaftNode) SnapshotIndex() uint64 {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.snapshotIndex
+}
+
+// UncompactedLogEntries returns the number of log entries after the latest snapshot.
+func (n *RaftNode) UncompactedLogEntries() uint64 {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.uncompactedLogEntriesLocked()
+}
+
+// LogLength returns the in-memory Raft log length including the sentinel entry.
+func (n *RaftNode) LogLength() int {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return len(n.log)
+}
+
+// FlushStorage persists the current in-memory log and metadata to disk.
+func (n *RaftNode) FlushStorage() error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.persistDurableStateLocked()
 }
 
 // Start launches the background election ticker loop for the node.
@@ -207,19 +283,25 @@ func (n *RaftNode) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesRep
 	n.knownLeaderID = args.LeaderID
 	n.knownLeaderTerm = args.Term
 
-	if args.PrevLogIndex >= uint64(len(n.log)) {
+	if args.PrevLogIndex < n.snapshotIndex {
 		reply.Term = n.CurrentTerm
 		return nil
 	}
 
-	prev := n.log[args.PrevLogIndex]
+	prevOffset := n.logOffsetForIndex(args.PrevLogIndex)
+	if prevOffset >= len(n.log) {
+		reply.Term = n.CurrentTerm
+		return nil
+	}
+
+	prev := n.log[prevOffset]
 	if prev.Term != args.PrevLogTerm {
 		reply.Term = n.CurrentTerm
 		return nil
 	}
 
 	if len(args.Entries) > 0 {
-		n.log = append(n.log[:args.PrevLogIndex+1], n.entriesFromArgs(args)...)
+		n.log = append(n.log[:prevOffset+1], n.entriesFromArgs(args)...)
 	}
 
 	if args.LeaderCommit > n.commitIndex {
@@ -232,9 +314,74 @@ func (n *RaftNode) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesRep
 	}
 
 	n.applyCommittedLocked()
+	if n.storage != nil {
+		_ = n.persistDurableStateLocked()
+	}
 
 	reply.Term = n.CurrentTerm
 	reply.Success = true
+	return nil
+}
+
+// InstallSnapshot rebuilds local FSM state from a leader snapshot when log entries were compacted away.
+func (n *RaftNode) InstallSnapshot(args InstallSnapshotArgs, reply *InstallSnapshotReply) error {
+	if reply == nil {
+		return fmt.Errorf("install snapshot reply is nil")
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	reply.Term = n.CurrentTerm
+
+	if args.Term < n.CurrentTerm {
+		return nil
+	}
+	defer n.notifyHeartbeat()
+
+	if args.Term > n.CurrentTerm || n.State != StateFollower {
+		n.becomeFollowerLocked(args.Term)
+	} else {
+		n.CurrentTerm = args.Term
+		n.VotedFor = ""
+	}
+	n.knownLeaderID = args.LeaderID
+	n.knownLeaderTerm = args.Term
+
+	if args.LastIncludedIndex <= n.snapshotIndex {
+		return nil
+	}
+
+	if err := n.MatchFSM.Restore(args.Data); err != nil {
+		return fmt.Errorf("restore snapshot at index %d: %w", args.LastIncludedIndex, err)
+	}
+
+	tailOffset := n.logOffsetForIndex(args.LastIncludedIndex) + 1
+	var tail []LogEntry
+	if tailOffset > 0 && tailOffset < len(n.log) {
+		tail = append([]LogEntry(nil), n.log[tailOffset:]...)
+	}
+
+	n.snapshotIndex = args.LastIncludedIndex
+	n.snapshotTerm = args.LastIncludedTerm
+	n.lastSnapshot = append([]byte(nil), args.Data...)
+	n.lastApplied = args.LastIncludedIndex
+	n.log = append([]LogEntry{{Index: args.LastIncludedIndex, Term: args.LastIncludedTerm}}, tail...)
+
+	if args.LastIncludedIndex < n.commitIndex {
+		n.commitIndex = args.LastIncludedIndex
+	}
+
+	if n.storage != nil {
+		if err := n.storage.PersistSnapshot(args.LastIncludedIndex, args.LastIncludedTerm, args.Data); err != nil {
+			return fmt.Errorf("persist installed snapshot: %w", err)
+		}
+		if err := n.persistDurableStateLocked(); err != nil {
+			return err
+		}
+	}
+
+	reply.Term = n.CurrentTerm
 	return nil
 }
 
@@ -426,12 +573,19 @@ func (n *RaftNode) broadcastHeartbeats(term uint64) {
 			continue
 		}
 		nextIdx := n.nextIndex[peerID]
+		if nextIdx <= n.snapshotIndex {
+			go n.sendInstallSnapshot(peerID, addr, term)
+			continue
+		}
+
 		prevLogIndex := nextIdx - 1
-		prevLogTerm := n.log[prevLogIndex].Term
+		prevOffset := n.logOffsetForIndex(prevLogIndex)
+		prevLogTerm := n.log[prevOffset].Term
 
 		var entries []LogEntry
-		if nextIdx < uint64(len(n.log)) {
-			entries = append([]LogEntry(nil), n.log[nextIdx:]...)
+		startOffset := n.logOffsetForIndex(nextIdx)
+		if startOffset < len(n.log) {
+			entries = append([]LogEntry(nil), n.log[startOffset:]...)
 		}
 
 		tasks = append(tasks, peerReplication{
@@ -478,6 +632,11 @@ func (n *RaftNode) broadcastHeartbeats(term uint64) {
 				return
 			}
 
+			if n.nextIndex[task.peerID] <= n.snapshotIndex+1 {
+				go n.sendInstallSnapshot(task.peerID, task.addr, term)
+				return
+			}
+
 			if n.nextIndex[task.peerID] > 1 {
 				n.nextIndex[task.peerID]--
 			}
@@ -490,7 +649,8 @@ func (n *RaftNode) advanceCommitIndexLocked() {
 	lastIdx := n.lastLogIndexLocked()
 
 	for idx := lastIdx; idx > n.commitIndex; idx-- {
-		if n.log[idx].Term != n.CurrentTerm {
+		offset := n.logOffsetForIndex(idx)
+		if offset < 0 || offset >= len(n.log) || n.log[offset].Term != n.CurrentTerm {
 			continue
 		}
 
@@ -526,6 +686,9 @@ func (n *RaftNode) Propose(command []byte) (uint64, error) {
 		Term:    n.CurrentTerm,
 		Command: append([]byte(nil), command...),
 	})
+	if n.storage != nil {
+		_ = n.persistDurableStateLocked()
+	}
 	term := n.CurrentTerm
 	n.mu.Unlock()
 
@@ -766,11 +929,24 @@ func randomElectionTimeout() time.Duration {
 }
 
 func (n *RaftNode) lastLogIndexLocked() uint64 {
-	return uint64(len(n.log) - 1)
+	if len(n.log) == 0 {
+		return n.snapshotIndex
+	}
+	return n.log[len(n.log)-1].Index
 }
 
 func (n *RaftNode) lastLogTermLocked() uint64 {
+	if len(n.log) == 0 {
+		return n.snapshotTerm
+	}
 	return n.log[len(n.log)-1].Term
+}
+
+func (n *RaftNode) logOffsetForIndex(index uint64) int {
+	if index < n.snapshotIndex {
+		return -1
+	}
+	return int(index - n.snapshotIndex)
 }
 
 func (n *RaftNode) logIsUpToDateLocked(lastLogIndex, lastLogTerm uint64) bool {
@@ -807,10 +983,209 @@ func (n *RaftNode) applyCommittedLocked() {
 	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
 		index := n.lastApplied
-		result := n.MatchFSM.Apply(n.log[index].Command)
+		offset := n.logOffsetForIndex(index)
+		if offset < 0 || offset >= len(n.log) {
+			n.lastApplied--
+			break
+		}
+		result := n.MatchFSM.Apply(n.log[offset].Command)
 		n.recordApplyResultLocked(index, result)
 		n.dispatchApplyNotification(result)
 	}
+	_ = n.maybeCompactLocked()
+}
+
+func (n *RaftNode) bootstrapFromStorage() error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	record, err := n.storage.LoadSnapshot()
+	if err != nil {
+		return fmt.Errorf("load snapshot: %w", err)
+	}
+	if record != nil {
+		if err := n.MatchFSM.Restore(record.Data); err != nil {
+			return fmt.Errorf("restore snapshot at index %d: %w", record.LastIncludedIndex, err)
+		}
+		n.snapshotIndex = record.LastIncludedIndex
+		n.snapshotTerm = record.LastIncludedTerm
+		n.lastSnapshot = append([]byte(nil), record.Data...)
+		n.lastApplied = record.LastIncludedIndex
+	}
+
+	entries, meta, err := n.storage.LoadLog()
+	if err != nil {
+		return fmt.Errorf("load log: %w", err)
+	}
+
+	n.log = []LogEntry{{Index: n.snapshotIndex, Term: n.snapshotTerm}}
+	for _, entry := range entries {
+		if entry.Index <= n.snapshotIndex {
+			continue
+		}
+		n.log = append(n.log, LogEntry{
+			Index:   entry.Index,
+			Term:    entry.Term,
+			Command: append([]byte(nil), entry.Command...),
+		})
+	}
+
+	if meta != nil {
+		if meta.SnapshotIndex > n.snapshotIndex {
+			n.snapshotIndex = meta.SnapshotIndex
+			n.snapshotTerm = meta.SnapshotTerm
+		}
+		if meta.CommitIndex > n.commitIndex {
+			n.commitIndex = meta.CommitIndex
+		}
+		if meta.CurrentTerm > n.CurrentTerm {
+			n.CurrentTerm = meta.CurrentTerm
+		}
+		if meta.VotedFor != "" {
+			n.VotedFor = meta.VotedFor
+		}
+	}
+
+	lastIdx := n.lastLogIndexLocked()
+	if lastIdx > n.commitIndex {
+		n.commitIndex = lastIdx
+	}
+
+	if n.lastApplied < n.snapshotIndex {
+		n.lastApplied = n.snapshotIndex
+	}
+	if n.commitIndex < n.snapshotIndex {
+		n.commitIndex = n.snapshotIndex
+	}
+
+	n.replayUncompactedLogLocked()
+	return nil
+}
+
+func (n *RaftNode) replayUncompactedLogLocked() {
+	for n.lastApplied < n.commitIndex {
+		n.lastApplied++
+		index := n.lastApplied
+		offset := n.logOffsetForIndex(index)
+		if offset < 0 || offset >= len(n.log) {
+			n.lastApplied = index - 1
+			break
+		}
+		result := n.MatchFSM.Apply(n.log[offset].Command)
+		n.recordApplyResultLocked(index, result)
+	}
+}
+
+func (n *RaftNode) maybeCompactLocked() error {
+	if n.uncompactedLogEntriesLocked() < n.compactThreshold {
+		return nil
+	}
+
+	compactUpTo := n.lastApplied
+	if compactUpTo <= n.snapshotIndex {
+		return nil
+	}
+
+	data, err := n.MatchFSM.CreateSnapshot()
+	if err != nil {
+		return fmt.Errorf("create snapshot at index %d: %w", compactUpTo, err)
+	}
+
+	term := n.log[n.logOffsetForIndex(compactUpTo)].Term
+	if n.storage != nil {
+		if err := n.storage.PersistSnapshot(compactUpTo, term, data); err != nil {
+			return fmt.Errorf("persist snapshot at index %d: %w", compactUpTo, err)
+		}
+	}
+
+	tailOffset := n.logOffsetForIndex(compactUpTo) + 1
+	var tail []LogEntry
+	if tailOffset > 0 && tailOffset < len(n.log) {
+		tail = append([]LogEntry(nil), n.log[tailOffset:]...)
+	}
+
+	n.snapshotIndex = compactUpTo
+	n.snapshotTerm = term
+	n.lastSnapshot = append([]byte(nil), data...)
+	n.log = append([]LogEntry{{Index: compactUpTo, Term: term}}, tail...)
+
+	if n.storage != nil {
+		if err := n.persistDurableStateLocked(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (n *RaftNode) truncateLogInMemoryLocked(upToIndex uint64) {
+	term := n.snapshotTerm
+	offset := n.logOffsetForIndex(upToIndex)
+	if offset >= 0 && offset < len(n.log) {
+		term = n.log[offset].Term
+	}
+
+	tailOffset := offset + 1
+	if tailOffset >= len(n.log) {
+		n.log = []LogEntry{{Index: upToIndex, Term: term}}
+		return
+	}
+	n.log = append([]LogEntry{{Index: upToIndex, Term: term}}, n.log[tailOffset:]...)
+}
+
+func (n *RaftNode) persistDurableStateLocked() error {
+	if n.storage == nil {
+		return nil
+	}
+
+	entries := make([]database.PersistedLogEntry, 0, len(n.log)-1)
+	for i := 1; i < len(n.log); i++ {
+		entry := n.log[i]
+		if entry.Index <= n.snapshotIndex {
+			continue
+		}
+		entries = append(entries, database.PersistedLogEntry{
+			Index:   entry.Index,
+			Term:    entry.Term,
+			Command: append([]byte(nil), entry.Command...),
+		})
+	}
+
+	meta := database.RaftMeta{
+		SnapshotIndex: n.snapshotIndex,
+		SnapshotTerm:  n.snapshotTerm,
+		CommitIndex:   n.commitIndex,
+		LastApplied:   n.lastApplied,
+		CurrentTerm:   n.CurrentTerm,
+		VotedFor:      n.VotedFor,
+	}
+	return n.storage.TruncateLog(entries, meta)
+}
+
+func (n *RaftNode) uncompactedLogEntriesLocked() uint64 {
+	lastIdx := n.lastLogIndexLocked()
+	if lastIdx <= n.snapshotIndex {
+		return 0
+	}
+	return lastIdx - n.snapshotIndex
+}
+
+func (n *RaftNode) sendInstallSnapshot(peerID, addr string, term uint64) {
+	n.mu.RLock()
+	if n.State != StateLeader || n.CurrentTerm != term || len(n.lastSnapshot) == 0 {
+		n.mu.RUnlock()
+		return
+	}
+	args := InstallSnapshotArgs{
+		Term:              term,
+		LeaderID:          n.NodeID,
+		LastIncludedIndex: n.snapshotIndex,
+		LastIncludedTerm:  n.snapshotTerm,
+		Data:              append([]byte(nil), n.lastSnapshot...),
+	}
+	n.mu.RUnlock()
+
+	var reply InstallSnapshotReply
+	_ = SendRPC(addr, peerID+".InstallSnapshot", args, &reply)
 }
 
 func (n *RaftNode) recordApplyResultLocked(index uint64, result interface{}) {
