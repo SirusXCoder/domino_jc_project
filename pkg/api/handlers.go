@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"domino_jc_project/pkg/consensus"
+	"domino_jc_project/pkg/engine"
+	"domino_jc_project/pkg/gateway"
 	"domino_jc_project/pkg/repository"
 )
 
@@ -142,20 +144,39 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
-// GatewayHandler exposes cluster leadership and session routing metadata for gateways.
+// GatewayHandler exposes cluster leadership, session routing metadata, and the
+// external match read/mutate API for game clients.
 type GatewayHandler struct {
-	raft *consensus.RaftNode
+	raft        *consensus.RaftNode
+	matchGateway *gateway.MatchGateway
+}
+
+// GatewayOption configures optional GatewayHandler behavior.
+type GatewayOption func(*GatewayHandler)
+
+// WithMatchGateway enables GET /match/read and POST /match/mutate on the gateway mux.
+func WithMatchGateway(manager *engine.GameManager, opts ...gateway.MatchGatewayOption) GatewayOption {
+	return func(h *GatewayHandler) {
+		h.matchGateway = gateway.NewMatchGateway(h.raft, manager, opts...)
+	}
 }
 
 // NewGatewayHandler constructs HTTP handlers for gateway failover and routing.
-func NewGatewayHandler(raft *consensus.RaftNode) *GatewayHandler {
-	return &GatewayHandler{raft: raft}
+func NewGatewayHandler(raft *consensus.RaftNode, opts ...GatewayOption) *GatewayHandler {
+	h := &GatewayHandler{raft: raft}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
 }
 
 // Register mounts gateway orchestration routes on the provided mux.
 func (h *GatewayHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/gateway/leader", h.handleLeader)
 	mux.HandleFunc("/api/gateway/session", h.handleSessionRoute)
+	if h.matchGateway != nil {
+		h.matchGateway.Register(mux)
+	}
 }
 
 func (h *GatewayHandler) handleLeader(w http.ResponseWriter, r *http.Request) {

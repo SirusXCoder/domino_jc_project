@@ -8,10 +8,25 @@ import (
 )
 
 const (
-	OpStartMatch    = "START_MATCH"
-	OpApplyTurn     = "APPLY_TURN"
-	OpLedgerBalance = "LEDGER_BALANCE"
+	OpStartMatch     = "START_MATCH"
+	OpApplyTurn      = "APPLY_TURN"
+	OpLedgerBalance  = "LEDGER_BALANCE"
+	OpAddNode        = "ADD_NODE"
+	OpRemoveNode     = "REMOVE_NODE"
+	OpCommitConfig   = "COMMIT_CONFIG"
+	ClusterMatchID   = "_cluster"
 )
+
+// AddNodeCommand enters joint consensus by adding a peer to the new configuration.
+type AddNodeCommand struct {
+	NodeID  string `json:"node_id"`
+	Address string `json:"address"`
+}
+
+// RemoveNodeCommand enters joint consensus by removing a peer from the new configuration.
+type RemoveNodeCommand struct {
+	NodeID string `json:"node_id"`
+}
 
 // StartMatchPayload configures session creation and optional game setup.
 type StartMatchPayload struct {
@@ -75,6 +90,16 @@ func (p LedgerBalancePayload) ToStatsUpdate(matchID string) models.PlayerStatsUp
 	}
 }
 
+// IsMembershipOp reports whether op mutates cluster configuration instead of game state.
+func IsMembershipOp(op string) bool {
+	switch op {
+	case OpAddNode, OpRemoveNode, OpCommitConfig:
+		return true
+	default:
+		return false
+	}
+}
+
 // DecodeCommand unmarshals a replicated log entry into a Command.
 func DecodeCommand(logEntry []byte) (Command, error) {
 	var cmd Command
@@ -84,10 +109,63 @@ func DecodeCommand(logEntry []byte) (Command, error) {
 	if cmd.Op == "" {
 		return Command{}, fmt.Errorf("command op is required")
 	}
-	if cmd.MatchID == "" {
+	if cmd.MatchID == "" && !IsMembershipOp(cmd.Op) {
 		return Command{}, fmt.Errorf("command match_id is required")
 	}
 	return cmd, nil
+}
+
+// DecodeAddNodeCommand unmarshals the ADD_NODE payload bytes.
+func DecodeAddNodeCommand(payload []byte) (AddNodeCommand, error) {
+	if len(payload) == 0 {
+		return AddNodeCommand{}, fmt.Errorf("add node payload is required")
+	}
+	var out AddNodeCommand
+	if err := json.Unmarshal(payload, &out); err != nil {
+		return AddNodeCommand{}, fmt.Errorf("decode add node payload: %w", err)
+	}
+	if out.NodeID == "" {
+		return AddNodeCommand{}, fmt.Errorf("node_id is required")
+	}
+	if out.Address == "" {
+		return AddNodeCommand{}, fmt.Errorf("address is required")
+	}
+	return out, nil
+}
+
+// DecodeRemoveNodeCommand unmarshals the REMOVE_NODE payload bytes.
+func DecodeRemoveNodeCommand(payload []byte) (RemoveNodeCommand, error) {
+	if len(payload) == 0 {
+		return RemoveNodeCommand{}, fmt.Errorf("remove node payload is required")
+	}
+	var out RemoveNodeCommand
+	if err := json.Unmarshal(payload, &out); err != nil {
+		return RemoveNodeCommand{}, fmt.Errorf("decode remove node payload: %w", err)
+	}
+	if out.NodeID == "" {
+		return RemoveNodeCommand{}, fmt.Errorf("node_id is required")
+	}
+	return out, nil
+}
+
+// EncodeAddNodeCommand marshals an ADD_NODE configuration change.
+func EncodeAddNodeCommand(nodeID, address string) ([]byte, error) {
+	return EncodeCommandWithPayload(OpAddNode, ClusterMatchID, AddNodeCommand{
+		NodeID:  nodeID,
+		Address: address,
+	})
+}
+
+// EncodeRemoveNodeCommand marshals a REMOVE_NODE configuration change.
+func EncodeRemoveNodeCommand(nodeID string) ([]byte, error) {
+	return EncodeCommandWithPayload(OpRemoveNode, ClusterMatchID, RemoveNodeCommand{
+		NodeID: nodeID,
+	})
+}
+
+// EncodeCommitConfigCommand marshals the joint-consensus exit step.
+func EncodeCommitConfigCommand() ([]byte, error) {
+	return EncodeCommandWithPayload(OpCommitConfig, ClusterMatchID, nil)
 }
 
 // DecodeStartMatchPayload unmarshals the START_MATCH payload bytes.
@@ -139,11 +217,16 @@ func DecodeLedgerBalancePayload(payload []byte) (LedgerBalancePayload, error) {
 func EncodeCommandWithPayload(op, matchID string, payload interface{}) ([]byte, error) {
 	cmd := Command{Op: op, MatchID: matchID}
 	if payload != nil {
-		raw, err := json.Marshal(payload)
-		if err != nil {
-			return nil, fmt.Errorf("marshal payload: %w", err)
+		switch typed := payload.(type) {
+		case []byte:
+			cmd.Payload = append([]byte(nil), typed...)
+		default:
+			raw, err := json.Marshal(payload)
+			if err != nil {
+				return nil, fmt.Errorf("marshal payload: %w", err)
+			}
+			cmd.Payload = raw
 		}
-		cmd.Payload = raw
 	}
 	return json.Marshal(cmd)
 }

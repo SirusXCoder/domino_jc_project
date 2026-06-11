@@ -47,7 +47,19 @@ const (
 	electionTimeoutMin = 150 * time.Millisecond
 	electionTimeoutMax = 300 * time.Millisecond
 	heartbeatInterval  = 50 * time.Millisecond
+	// defaultReplicationRoundTimeout bounds a full leader fan-out replication cycle.
+	defaultReplicationRoundTimeout = 500 * time.Millisecond
 )
+
+type replicationTask struct {
+	peerID       string
+	addr         string
+	prevLogIndex uint64
+	prevLogTerm  uint64
+	entries      []LogEntry
+	leaderCommit uint64
+	installSnap  bool
+}
 
 // RequestVoteArgs is the RPC payload for leader election.
 type RequestVoteArgs struct {
@@ -102,6 +114,12 @@ type InstallSnapshotReply struct {
 
 const defaultCompactThreshold uint64 = 1000
 
+// jointConfig holds old-new membership during a Raft configuration transition.
+type jointConfig struct {
+	old map[string]string
+	new map[string]string
+}
+
 // RaftNode encapsulates cluster metadata, election state, and the match FSM.
 type RaftNode struct {
 	mu sync.RWMutex
@@ -121,6 +139,8 @@ type RaftNode struct {
 	nextIndex  map[string]uint64
 	matchIndex map[string]uint64
 
+	joint *jointConfig
+
 	knownLeaderID   string
 	knownLeaderTerm uint64
 
@@ -137,6 +157,9 @@ type RaftNode struct {
 	electionReset chan struct{}
 	heartbeatStop chan struct{}
 }
+
+// testPersistObserver counts durable log writes during integration tests.
+var testPersistObserver func()
 
 // NewRaftNode initializes a follower node wired to the provided match FSM.
 func NewRaftNode(nodeID string, peers map[string]string, fsm GameFSM) *RaftNode {
@@ -467,8 +490,7 @@ func (n *RaftNode) startElection(ctx context.Context) {
 			peers[peerID] = addr
 		}
 	}
-	clusterSize := len(peers) + 1
-	majority := clusterSize/2 + 1
+	majority := n.electionMajorityLocked()
 	n.mu.Unlock()
 
 	votes := 1
@@ -551,30 +573,70 @@ func (n *RaftNode) initLeaderReplicationLocked() {
 }
 
 func (n *RaftNode) broadcastHeartbeats(term uint64) {
-	type peerReplication struct {
-		peerID       string
-		addr         string
-		prevLogIndex uint64
-		prevLogTerm  uint64
-		entries      []LogEntry
-		leaderCommit uint64
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), defaultReplicationRoundTimeout)
+		defer cancel()
+		_ = n.replicateAndCommit(ctx, term)
+	}()
+}
+
+// replicateAndCommit fans out AppendEntries or InstallSnapshot RPCs to peers and
+// waits for the round to finish or the context to expire. Unresponsive peers are
+// skipped without blocking the caller indefinitely.
+func (n *RaftNode) replicateAndCommit(ctx context.Context, term uint64) error {
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
+	tasks, leaderID, ok := n.collectReplicationTasks(term)
+	if !ok || len(tasks) == 0 {
+		return nil
+	}
+
+	var wg sync.WaitGroup
+	for _, task := range tasks {
+		wg.Add(1)
+		go func(task replicationTask) {
+			defer wg.Done()
+			n.replicateToPeer(ctx, term, leaderID, task)
+		}(task)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		return nil
+	}
+}
+
+func (n *RaftNode) collectReplicationTasks(term uint64) (tasks []replicationTask, leaderID string, ok bool) {
 	n.mu.Lock()
+	defer n.mu.Unlock()
+
 	if n.State != StateLeader || n.CurrentTerm != term {
-		n.mu.Unlock()
-		return
+		return nil, "", false
 	}
 
-	leaderID := n.NodeID
-	tasks := make([]peerReplication, 0, len(n.PeerAddresses))
+	leaderID = n.NodeID
+	tasks = make([]replicationTask, 0, len(n.PeerAddresses))
 	for peerID, addr := range n.PeerAddresses {
 		if peerID == n.NodeID {
 			continue
 		}
 		nextIdx := n.nextIndex[peerID]
 		if nextIdx <= n.snapshotIndex {
-			go n.sendInstallSnapshot(peerID, addr, term)
+			tasks = append(tasks, replicationTask{
+				peerID:      peerID,
+				addr:        addr,
+				installSnap: true,
+			})
 			continue
 		}
 
@@ -588,7 +650,7 @@ func (n *RaftNode) broadcastHeartbeats(term uint64) {
 			entries = append([]LogEntry(nil), n.log[startOffset:]...)
 		}
 
-		tasks = append(tasks, peerReplication{
+		tasks = append(tasks, replicationTask{
 			peerID:       peerID,
 			addr:         addr,
 			prevLogIndex: prevLogIndex,
@@ -597,55 +659,66 @@ func (n *RaftNode) broadcastHeartbeats(term uint64) {
 			leaderCommit: n.commitIndex,
 		})
 	}
-	n.mu.Unlock()
+	return tasks, leaderID, true
+}
 
-	for _, task := range tasks {
-		go func(task peerReplication) {
-			args := AppendEntriesArgs{
-				Term:         term,
-				LeaderID:     leaderID,
-				PrevLogIndex: task.prevLogIndex,
-				PrevLogTerm:  task.prevLogTerm,
-				Entries:      task.entries,
-				LeaderCommit: task.leaderCommit,
-			}
-			var reply AppendEntriesReply
-			if err := SendRPC(task.addr, task.peerID+".AppendEntries", args, &reply); err != nil {
-				return
-			}
+func (n *RaftNode) replicateToPeer(ctx context.Context, term uint64, leaderID string, task replicationTask) {
+	select {
+	case <-ctx.Done():
+		return
+	default:
+	}
 
-			n.mu.Lock()
-			defer n.mu.Unlock()
+	if task.installSnap {
+		n.sendInstallSnapshotWithContext(ctx, task.peerID, task.addr, term)
+		return
+	}
 
-			if reply.Term > n.CurrentTerm {
-				n.becomeFollowerLocked(reply.Term)
-				return
-			}
-			if n.State != StateLeader || n.CurrentTerm != term {
-				return
-			}
+	args := AppendEntriesArgs{
+		Term:         term,
+		LeaderID:     leaderID,
+		PrevLogIndex: task.prevLogIndex,
+		PrevLogTerm:  task.prevLogTerm,
+		Entries:      task.entries,
+		LeaderCommit: task.leaderCommit,
+	}
+	var reply AppendEntriesReply
+	if err := SendRPCWithContext(ctx, task.addr, task.peerID+".AppendEntries", args, &reply); err != nil {
+		return
+	}
+	n.handleAppendEntriesReply(term, task.peerID, task.addr, args, reply)
+}
 
-			if reply.Success {
-				n.matchIndex[task.peerID] = args.PrevLogIndex + uint64(len(args.Entries))
-				n.nextIndex[task.peerID] = n.matchIndex[task.peerID] + 1
-				n.advanceCommitIndexLocked()
-				return
-			}
+func (n *RaftNode) handleAppendEntriesReply(term uint64, peerID, addr string, args AppendEntriesArgs, reply AppendEntriesReply) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 
-			if n.nextIndex[task.peerID] <= n.snapshotIndex+1 {
-				go n.sendInstallSnapshot(task.peerID, task.addr, term)
-				return
-			}
+	if reply.Term > n.CurrentTerm {
+		n.becomeFollowerLocked(reply.Term)
+		return
+	}
+	if n.State != StateLeader || n.CurrentTerm != term {
+		return
+	}
 
-			if n.nextIndex[task.peerID] > 1 {
-				n.nextIndex[task.peerID]--
-			}
-		}(task)
+	if reply.Success {
+		n.matchIndex[peerID] = args.PrevLogIndex + uint64(len(args.Entries))
+		n.nextIndex[peerID] = n.matchIndex[peerID] + 1
+		n.advanceCommitIndexLocked()
+		return
+	}
+
+	if n.nextIndex[peerID] <= n.snapshotIndex+1 {
+		go n.sendInstallSnapshot(peerID, addr, term)
+		return
+	}
+
+	if n.nextIndex[peerID] > 1 {
+		n.nextIndex[peerID]--
 	}
 }
 
 func (n *RaftNode) advanceCommitIndexLocked() {
-	majority := len(n.PeerAddresses)/2 + 1
 	lastIdx := n.lastLogIndexLocked()
 
 	for idx := lastIdx; idx > n.commitIndex; idx-- {
@@ -654,18 +727,78 @@ func (n *RaftNode) advanceCommitIndexLocked() {
 			continue
 		}
 
-		replicated := 1
-		for peerID := range n.matchIndex {
-			if n.matchIndex[peerID] >= idx {
-				replicated++
-			}
-		}
-		if replicated >= majority {
+		if n.quorumMetForIndexLocked(idx) {
 			n.commitIndex = idx
 			n.applyCommittedLocked()
 			return
 		}
 	}
+}
+
+func (n *RaftNode) quorumMetForIndexLocked(index uint64) bool {
+	if n.joint != nil {
+		return n.quorumMetInConfigLocked(index, n.joint.old) &&
+			n.quorumMetInConfigLocked(index, n.joint.new)
+	}
+	return n.quorumMetInConfigLocked(index, n.PeerAddresses)
+}
+
+func (n *RaftNode) quorumMetInConfigLocked(index uint64, config map[string]string) bool {
+	voters := n.activeVotersInConfigLocked(config)
+	if voters == 0 {
+		return true
+	}
+	majority := voters/2 + 1
+	return n.replicationCountInConfigLocked(index, config) >= majority
+}
+
+func (n *RaftNode) activeVotersInConfigLocked(config map[string]string) int {
+	count := 0
+	for peerID := range config {
+		if n.isPendingNewPeerLocked(peerID) {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func (n *RaftNode) isPendingNewPeerLocked(peerID string) bool {
+	if n.joint == nil {
+		return false
+	}
+	if _, inOld := n.joint.old[peerID]; inOld {
+		return false
+	}
+	if n.matchIndex == nil {
+		return true
+	}
+	return n.matchIndex[peerID] == 0
+}
+
+func (n *RaftNode) replicationCountInConfigLocked(index uint64, config map[string]string) int {
+	count := 0
+	for peerID := range config {
+		if n.isPendingNewPeerLocked(peerID) {
+			continue
+		}
+		if peerID == n.NodeID {
+			count++
+			continue
+		}
+		if n.matchIndex != nil && n.matchIndex[peerID] >= index {
+			count++
+		}
+	}
+	return count
+}
+
+func (n *RaftNode) electionMajorityLocked() int {
+	config := n.PeerAddresses
+	if n.joint != nil {
+		config = n.joint.old
+	}
+	return len(config)/2 + 1
 }
 
 // Propose appends a command to the leader log and immediately replicates it to followers.
@@ -777,7 +910,19 @@ func (n *RaftNode) waitForCommit(index uint64, timeout time.Duration) error {
 		if committed {
 			return nil
 		}
-		n.broadcastHeartbeats(term)
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		roundTimeout := defaultReplicationRoundTimeout
+		if remaining < roundTimeout {
+			roundTimeout = remaining
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), roundTimeout)
+		_ = n.replicateAndCommit(ctx, term)
+		cancel()
+
 		time.Sleep(10 * time.Millisecond)
 	}
 	return fmt.Errorf("timed out waiting for commit at index %d", index)
@@ -805,9 +950,16 @@ func (n *RaftNode) waitForApply(index uint64, timeout time.Duration) (interface{
 	}
 }
 
-// ReadLinearizableState confirms leadership with a quorum, then reads from the local GameFSM.
+// ReadLinearizableState performs a ReadIndex linearizable read without appending to the log.
 func (n *RaftNode) ReadLinearizableState() (map[string]matchState, error) {
-	if err := n.VerifyLeader(); err != nil {
+	readIndex, term, err := n.beginReadIndex()
+	if err != nil {
+		return nil, err
+	}
+	if err := n.confirmLeadershipForRead(term, readIndex); err != nil {
+		return nil, err
+	}
+	if err := n.waitForReadIndex(readIndex, defaultProposeTimeout); err != nil {
 		return nil, err
 	}
 
@@ -818,23 +970,52 @@ func (n *RaftNode) ReadLinearizableState() (map[string]matchState, error) {
 	return fsm.Matches(), nil
 }
 
-// VerifyLeader confirms leadership with a quorum via rapid AppendEntries heartbeats.
-// Callers may read directly from the GameFSM after a successful verification.
-func (n *RaftNode) VerifyLeader() error {
+// beginReadIndex records the current commit index for a linearizable read.
+func (n *RaftNode) beginReadIndex() (readIndex, term uint64, err error) {
 	n.mu.Lock()
-	if n.State != StateLeader {
-		n.mu.Unlock()
-		return fmt.Errorf("not leader")
-	}
-	term := n.CurrentTerm
-	majority := len(n.PeerAddresses)/2 + 1
+	defer n.mu.Unlock()
 
-	peers := make(map[string]string, len(n.PeerAddresses))
-	for peerID, addr := range n.PeerAddresses {
-		if peerID != n.NodeID {
-			peers[peerID] = addr
+	if n.State != StateLeader {
+		if redirect := n.leaderRedirectLocked(); redirect != nil {
+			return 0, 0, redirect
 		}
+		return 0, 0, ErrNotLeader
 	}
+	return n.commitIndex, n.CurrentTerm, nil
+}
+
+// waitForReadIndex blocks until the state machine has applied through readIndex.
+func (n *RaftNode) waitForReadIndex(readIndex uint64, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		n.mu.RLock()
+		ready := n.lastApplied >= readIndex
+		n.mu.RUnlock()
+		if ready {
+			return nil
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return fmt.Errorf("timed out waiting for read index %d", readIndex)
+}
+
+// VerifyLeader confirms leadership with a quorum via rapid AppendEntries heartbeats.
+func (n *RaftNode) VerifyLeader() error {
+	readIndex, term, err := n.beginReadIndex()
+	if err != nil {
+		return err
+	}
+	return n.confirmLeadershipForRead(term, readIndex)
+}
+
+func (n *RaftNode) confirmLeadershipForRead(term, readIndex uint64) error {
+	n.mu.Lock()
+	if n.State != StateLeader || n.CurrentTerm != term {
+		n.mu.Unlock()
+		return fmt.Errorf("leadership lost")
+	}
+	majority := n.electionMajorityLocked()
+	peers := n.remotePeersLocked()
 	n.mu.Unlock()
 
 	if len(peers) == 0 {
@@ -863,6 +1044,9 @@ func (n *RaftNode) VerifyLeader() error {
 			prevLogIndex := n.lastLogIndexLocked()
 			prevLogTerm := n.lastLogTermLocked()
 			leaderCommit := n.commitIndex
+			if leaderCommit < readIndex {
+				leaderCommit = readIndex
+			}
 			leaderID := n.NodeID
 			n.mu.Unlock()
 
@@ -907,6 +1091,153 @@ func (n *RaftNode) VerifyLeader() error {
 		return nil
 	}
 	return fmt.Errorf("failed to confirm leadership with quorum")
+}
+
+func (n *RaftNode) remotePeersLocked() map[string]string {
+	peers := make(map[string]string, len(n.PeerAddresses))
+	for peerID, addr := range n.PeerAddresses {
+		if peerID != n.NodeID {
+			peers[peerID] = addr
+		}
+	}
+	return peers
+}
+
+// IsInJointConsensus reports whether the node is in an old-new configuration transition.
+func (n *RaftNode) IsInJointConsensus() bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.joint != nil
+}
+
+// ProposeAddNode replicates a joint-consensus add-node transition and finalizes the new config.
+func (n *RaftNode) ProposeAddNode(nodeID, address string) error {
+	cmd, err := EncodeAddNodeCommand(nodeID, address)
+	if err != nil {
+		return err
+	}
+	if _, err := n.ProposeAndWait(cmd); err != nil {
+		return err
+	}
+	commitCmd, err := EncodeCommitConfigCommand()
+	if err != nil {
+		return err
+	}
+	_, err = n.ProposeAndWait(commitCmd)
+	return err
+}
+
+// ProposeRemoveNode replicates a joint-consensus remove-node transition and finalizes the new config.
+func (n *RaftNode) ProposeRemoveNode(nodeID string) error {
+	cmd, err := EncodeRemoveNodeCommand(nodeID)
+	if err != nil {
+		return err
+	}
+	if _, err := n.ProposeAndWait(cmd); err != nil {
+		return err
+	}
+	commitCmd, err := EncodeCommitConfigCommand()
+	if err != nil {
+		return err
+	}
+	_, err = n.ProposeAndWait(commitCmd)
+	return err
+}
+
+func (n *RaftNode) applyMembershipLocked(cmd Command) error {
+	switch cmd.Op {
+	case OpAddNode:
+		add, err := DecodeAddNodeCommand(cmd.Payload)
+		if err != nil {
+			return err
+		}
+		if _, ok := n.PeerAddresses[add.NodeID]; ok {
+			return fmt.Errorf("node %q already in cluster", add.NodeID)
+		}
+		if n.joint != nil {
+			return fmt.Errorf("already in joint consensus")
+		}
+		newPeers := clonePeerMap(n.PeerAddresses)
+		newPeers[add.NodeID] = add.Address
+		n.joint = &jointConfig{
+			old: clonePeerMap(n.PeerAddresses),
+			new: newPeers,
+		}
+		n.PeerAddresses = clonePeerMap(newPeers)
+		n.trackNewPeerLocked(add.NodeID)
+		return nil
+
+	case OpRemoveNode:
+		remove, err := DecodeRemoveNodeCommand(cmd.Payload)
+		if err != nil {
+			return err
+		}
+		if _, ok := n.PeerAddresses[remove.NodeID]; !ok {
+			return fmt.Errorf("node %q not in cluster", remove.NodeID)
+		}
+		if n.joint != nil {
+			return fmt.Errorf("already in joint consensus")
+		}
+		newPeers := clonePeerMap(n.PeerAddresses)
+		delete(newPeers, remove.NodeID)
+		n.joint = &jointConfig{
+			old: clonePeerMap(n.PeerAddresses),
+			new: newPeers,
+		}
+		n.PeerAddresses = clonePeerMap(newPeers)
+		n.dropPeerLocked(remove.NodeID)
+		return nil
+
+	case OpCommitConfig:
+		if n.joint == nil {
+			return fmt.Errorf("not in joint consensus")
+		}
+		n.PeerAddresses = clonePeerMap(n.joint.new)
+		n.joint = nil
+		n.pruneReplicationStateLocked()
+		return nil
+
+	default:
+		return fmt.Errorf("unknown membership op %q", cmd.Op)
+	}
+}
+
+func (n *RaftNode) trackNewPeerLocked(peerID string) {
+	if n.State != StateLeader || n.nextIndex == nil {
+		return
+	}
+	lastIdx := n.lastLogIndexLocked()
+	n.nextIndex[peerID] = lastIdx + 1
+	n.matchIndex[peerID] = 0
+}
+
+func (n *RaftNode) dropPeerLocked(peerID string) {
+	if n.nextIndex != nil {
+		delete(n.nextIndex, peerID)
+	}
+	if n.matchIndex != nil {
+		delete(n.matchIndex, peerID)
+	}
+}
+
+func (n *RaftNode) pruneReplicationStateLocked() {
+	if n.nextIndex == nil {
+		return
+	}
+	for peerID := range n.nextIndex {
+		if _, ok := n.PeerAddresses[peerID]; !ok {
+			delete(n.nextIndex, peerID)
+			delete(n.matchIndex, peerID)
+		}
+	}
+}
+
+func clonePeerMap(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for id, addr := range in {
+		out[id] = addr
+	}
+	return out
 }
 
 func (n *RaftNode) notifyHeartbeat() {
@@ -988,9 +1319,21 @@ func (n *RaftNode) applyCommittedLocked() {
 			n.lastApplied--
 			break
 		}
-		result := n.MatchFSM.Apply(n.log[offset].Command)
+		entry := n.log[offset]
+		cmd, err := DecodeCommand(entry.Command)
+		if err != nil {
+			n.recordApplyResultLocked(index, err)
+			continue
+		}
+
+		var result interface{}
+		if IsMembershipOp(cmd.Op) {
+			result = n.applyMembershipLocked(cmd)
+		} else {
+			result = n.MatchFSM.Apply(entry.Command)
+			n.dispatchApplyNotification(result)
+		}
 		n.recordApplyResultLocked(index, result)
-		n.dispatchApplyNotification(result)
 	}
 	_ = n.maybeCompactLocked()
 }
@@ -1071,7 +1414,18 @@ func (n *RaftNode) replayUncompactedLogLocked() {
 			n.lastApplied = index - 1
 			break
 		}
-		result := n.MatchFSM.Apply(n.log[offset].Command)
+		entry := n.log[offset]
+		cmd, err := DecodeCommand(entry.Command)
+		if err != nil {
+			n.recordApplyResultLocked(index, err)
+			continue
+		}
+		var result interface{}
+		if IsMembershipOp(cmd.Op) {
+			result = n.applyMembershipLocked(cmd)
+		} else {
+			result = n.MatchFSM.Apply(entry.Command)
+		}
 		n.recordApplyResultLocked(index, result)
 	}
 }
@@ -1133,6 +1487,9 @@ func (n *RaftNode) truncateLogInMemoryLocked(upToIndex uint64) {
 }
 
 func (n *RaftNode) persistDurableStateLocked() error {
+	if testPersistObserver != nil {
+		testPersistObserver()
+	}
 	if n.storage == nil {
 		return nil
 	}
@@ -1170,6 +1527,12 @@ func (n *RaftNode) uncompactedLogEntriesLocked() uint64 {
 }
 
 func (n *RaftNode) sendInstallSnapshot(peerID, addr string, term uint64) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultRPCTimeout)
+	defer cancel()
+	n.sendInstallSnapshotWithContext(ctx, peerID, addr, term)
+}
+
+func (n *RaftNode) sendInstallSnapshotWithContext(ctx context.Context, peerID, addr string, term uint64) {
 	n.mu.RLock()
 	if n.State != StateLeader || n.CurrentTerm != term || len(n.lastSnapshot) == 0 {
 		n.mu.RUnlock()
@@ -1185,7 +1548,7 @@ func (n *RaftNode) sendInstallSnapshot(peerID, addr string, term uint64) {
 	n.mu.RUnlock()
 
 	var reply InstallSnapshotReply
-	_ = SendRPC(addr, peerID+".InstallSnapshot", args, &reply)
+	_ = SendRPCWithContext(ctx, addr, peerID+".InstallSnapshot", args, &reply)
 }
 
 func (n *RaftNode) recordApplyResultLocked(index uint64, result interface{}) {

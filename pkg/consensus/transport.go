@@ -195,16 +195,44 @@ func (t *NetworkTransport) Wait() {
 	t.wg.Wait()
 }
 
+// PeerIsActive reports whether a node has registered an inbound RPC listener.
+func PeerIsActive(nodeID string) bool {
+	_, ok := activeRaftNodes.Load(nodeID)
+	return ok
+}
+
 // SendRPC dials a remote cluster node and dispatches a net/rpc call with a strict
 // 200ms deadline so an unreachable peer cannot block the state engine.
 func SendRPC(peerAddress string, method string, args interface{}, reply interface{}) error {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultRPCTimeout)
+	defer cancel()
+	return SendRPCWithContext(ctx, peerAddress, method, args, reply)
+}
+
+// SendRPCWithContext dispatches a net/rpc call bounded by the caller context and
+// defaultRPCTimeout, whichever expires first.
+func SendRPCWithContext(ctx context.Context, peerAddress string, method string, args interface{}, reply interface{}) error {
 	if testRPCObserver != nil {
 		if done := testRPCObserver(method); done != nil {
 			defer done()
 		}
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultRPCTimeout)
+	rpcTimeout := defaultRPCTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("rpc call %s to %s: %w", method, peerAddress, ctx.Err())
+		}
+		if remaining < rpcTimeout {
+			rpcTimeout = remaining
+		}
+	}
+
+	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
 	defer cancel()
 
 	type rpcResult struct {
@@ -217,8 +245,8 @@ func SendRPC(peerAddress string, method string, args interface{}, reply interfac
 	}()
 
 	select {
-	case <-ctx.Done():
-		return fmt.Errorf("rpc call %s to %s: %w", method, peerAddress, ctx.Err())
+	case <-rpcCtx.Done():
+		return fmt.Errorf("rpc call %s to %s: %w", method, peerAddress, rpcCtx.Err())
 	case result := <-done:
 		return result.err
 	}
