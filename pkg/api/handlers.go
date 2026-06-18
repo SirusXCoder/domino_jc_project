@@ -154,7 +154,7 @@ type GatewayHandler struct {
 // GatewayOption configures optional GatewayHandler behavior.
 type GatewayOption func(*GatewayHandler)
 
-// WithMatchGateway enables GET /match/read and POST /match/mutate on the gateway mux.
+// WithMatchGateway enables GET /match/read, POST /match/create, and POST /match/mutate on the gateway mux.
 func WithMatchGateway(manager *engine.GameManager, opts ...gateway.MatchGatewayOption) GatewayOption {
 	return func(h *GatewayHandler) {
 		h.matchGateway = gateway.NewMatchGateway(h.raft, manager, opts...)

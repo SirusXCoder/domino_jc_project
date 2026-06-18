@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"sync"
 	"time"
 
 	"domino_jc_project/pkg/database"
+	"domino_jc_project/pkg/telemetry"
 )
 
 // ErrNotLeader indicates the local node cannot accept replicated proposals.
@@ -375,6 +377,16 @@ func (n *RaftNode) InstallSnapshot(args InstallSnapshotArgs, reply *InstallSnaps
 		return nil
 	}
 
+	telemetry.DefaultLogger().Info("raft install snapshot received",
+		slog.String("event", "raft_install_snapshot_received"),
+		slog.String("node_id", n.NodeID),
+		slog.String("leader_id", args.LeaderID),
+		slog.Uint64("term", args.Term),
+		slog.Uint64("last_included_index", args.LastIncludedIndex),
+		slog.Uint64("last_included_term", args.LastIncludedTerm),
+		slog.Int("snapshot_bytes", len(args.Data)),
+	)
+
 	if err := n.MatchFSM.Restore(args.Data); err != nil {
 		return fmt.Errorf("restore snapshot at index %d: %w", args.LastIncludedIndex, err)
 	}
@@ -554,7 +566,14 @@ func (n *RaftNode) promoteToLeader(ctx context.Context, term uint64) {
 	}
 	n.State = StateLeader
 	n.initLeaderReplicationLocked()
+	nodeID := n.NodeID
 	n.mu.Unlock()
+
+	telemetry.DefaultLogger().Info("raft leader elected",
+		slog.String("event", "raft_leader_elected"),
+		slog.String("node_id", nodeID),
+		slog.Uint64("term", term),
+	)
 
 	go n.startHeartbeatTicker(ctx)
 }
@@ -1440,6 +1459,10 @@ func (n *RaftNode) maybeCompactLocked() error {
 		return nil
 	}
 
+	prevSnapshotIndex := n.snapshotIndex
+	logLenBefore := len(n.log)
+	uncompactedBefore := n.uncompactedLogEntriesLocked()
+
 	data, err := n.MatchFSM.CreateSnapshot()
 	if err != nil {
 		return fmt.Errorf("create snapshot at index %d: %w", compactUpTo, err)
@@ -1462,6 +1485,25 @@ func (n *RaftNode) maybeCompactLocked() error {
 	n.snapshotTerm = term
 	n.lastSnapshot = append([]byte(nil), data...)
 	n.log = append([]LogEntry{{Index: compactUpTo, Term: term}}, tail...)
+
+	telemetry.DefaultLogger().Info("raft snapshot created",
+		slog.String("event", "raft_snapshot_created"),
+		slog.String("node_id", n.NodeID),
+		slog.Uint64("snapshot_index", compactUpTo),
+		slog.Uint64("snapshot_term", term),
+		slog.Int("snapshot_bytes", len(data)),
+		slog.Uint64("compacted_entries", compactUpTo-prevSnapshotIndex),
+		slog.Uint64("uncompacted_before", uncompactedBefore),
+	)
+
+	telemetry.DefaultLogger().Info("raft log truncated",
+		slog.String("event", "raft_log_truncated"),
+		slog.String("node_id", n.NodeID),
+		slog.Uint64("truncated_through_index", compactUpTo),
+		slog.Int("log_entries_before", logLenBefore),
+		slog.Int("log_entries_after", len(n.log)),
+		slog.Uint64("entries_removed", uint64(logLenBefore-len(n.log))),
+	)
 
 	if n.storage != nil {
 		if err := n.persistDurableStateLocked(); err != nil {
@@ -1547,8 +1589,27 @@ func (n *RaftNode) sendInstallSnapshotWithContext(ctx context.Context, peerID, a
 	}
 	n.mu.RUnlock()
 
+	telemetry.DefaultLogger().Info("raft install snapshot sent",
+		slog.String("event", "raft_install_snapshot_sent"),
+		slog.String("node_id", args.LeaderID),
+		slog.String("peer_id", peerID),
+		slog.String("peer_addr", addr),
+		slog.Uint64("term", term),
+		slog.Uint64("last_included_index", args.LastIncludedIndex),
+		slog.Uint64("last_included_term", args.LastIncludedTerm),
+		slog.Int("snapshot_bytes", len(args.Data)),
+	)
+
 	var reply InstallSnapshotReply
-	_ = SendRPCWithContext(ctx, addr, peerID+".InstallSnapshot", args, &reply)
+	if err := SendRPCWithContext(ctx, addr, peerID+".InstallSnapshot", args, &reply); err != nil {
+		telemetry.DefaultLogger().Warn("raft install snapshot rpc failed",
+			slog.String("event", "raft_install_snapshot_failed"),
+			slog.String("node_id", args.LeaderID),
+			slog.String("peer_id", peerID),
+			slog.String("peer_addr", addr),
+			slog.Any("error", err),
+		)
+	}
 }
 
 func (n *RaftNode) recordApplyResultLocked(index uint64, result interface{}) {
@@ -1568,7 +1629,7 @@ func (n *RaftNode) dispatchApplyNotification(result interface{}) {
 		return
 	}
 	applyResult, ok := AsApplyResult(result)
-	if !ok || !applyResult.OK {
+	if !ok || !applyResult.OK || applyResult.Op == OpDebugNoop {
 		return
 	}
 	n.applyNotify(applyResult)

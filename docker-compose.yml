@@ -1,4 +1,13 @@
 version: '3.8'
+
+x-raft-env: &raft-env
+  RAFT_COMPACT_THRESHOLD: "50"
+  DGRAPH_ALPHA_GRPC: alpha:9080
+
+x-raft-depends: &raft-depends
+  alpha:
+    condition: service_healthy
+
 services:
   zero:
     image: dgraph/dgraph:latest
@@ -9,6 +18,8 @@ services:
       - "5080:5080"
       - "6080:6080"
     command: dgraph zero --my=zero:5080
+    networks:
+      - domino
 
   alpha:
     image: dgraph/dgraph:latest
@@ -21,6 +32,95 @@ services:
     command: dgraph alpha --my=alpha:7080 --zero=zero:5080 --security "whitelist=0.0.0.0/0"
     depends_on:
       - zero
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - domino
+
+  raft-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    container_name: domino_raft_1
+    hostname: raft-1
+    environment:
+      <<: *raft-env
+      RAFT_DATA_DIR: /data/raft
+      GATEWAY_HTTP_PEERS: node-2=raft-2:8080,node-3=raft-3:8080
+    volumes:
+      - raft_1_data:/data/raft
+    command:
+      - --id=node-1
+      - --raft-addr=:50051
+      - --gateway-addr=:8080
+      - --peers=node-2=raft-2:50051,node-3=raft-3:50051
+    ports:
+      - "8080:8080"
+      - "50051:50051"
+      - "2112:2112"
+    depends_on:
+      <<: *raft-depends
+    networks:
+      - domino
+
+  raft-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    container_name: domino_raft_2
+    hostname: raft-2
+    environment:
+      <<: *raft-env
+      RAFT_DATA_DIR: /data/raft
+      GATEWAY_HTTP_PEERS: node-1=raft-1:8080,node-3=raft-3:8080
+    volumes:
+      - raft_2_data:/data/raft
+    command:
+      - --id=node-2
+      - --raft-addr=:50051
+      - --gateway-addr=:8080
+      - --peers=node-1=raft-1:50051,node-3=raft-3:50051
+    ports:
+      - "8081:8080"
+      - "50052:50051"
+      - "2113:2112"
+    depends_on:
+      <<: *raft-depends
+    networks:
+      - domino
+
+  raft-3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    container_name: domino_raft_3
+    hostname: raft-3
+    environment:
+      <<: *raft-env
+      RAFT_DATA_DIR: /data/raft
+      GATEWAY_HTTP_PEERS: node-1=raft-1:8080,node-2=raft-2:8080
+    volumes:
+      - raft_3_data:/data/raft
+    command:
+      - --id=node-3
+      - --raft-addr=:50051
+      - --gateway-addr=:8080
+      - --peers=node-1=raft-1:50051,node-2=raft-2:50051
+    ports:
+      - "8082:8080"
+      - "50053:50051"
+      - "2114:2112"
+    depends_on:
+      <<: *raft-depends
+    networks:
+      - domino
 
   prometheus:
     image: prom/prometheus:latest
@@ -31,12 +131,23 @@ services:
       - "9090:9090"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    networks:
+      - domino
 
   grafana:
     image: grafana/grafana-oss:latest
     container_name: domino_grafana
     ports:
       - "3000:3000"
+    networks:
+      - domino
+
+networks:
+  domino:
+    driver: bridge
 
 volumes:
   dgraph_data:
+  raft_1_data:
+  raft_2_data:
+  raft_3_data:

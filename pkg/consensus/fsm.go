@@ -105,6 +105,11 @@ func (f *LocalGameFSM) Apply(logEntry []byte) interface{} {
 			MatchID: cmd.MatchID,
 			Applied: true,
 		}
+	case OpDebugNoop:
+		return ApplyResult{
+			OK: true,
+			Op: cmd.Op,
+		}
 	default:
 		return fmt.Errorf("unknown op %q", cmd.Op)
 	}
@@ -228,6 +233,12 @@ func (f *ManagedGameFSM) Apply(logEntry []byte) interface{} {
 			Op:      cmd.Op,
 			MatchID: cmd.MatchID,
 			Ledger:  update,
+		}
+
+	case OpDebugNoop:
+		return ApplyResult{
+			OK: true,
+			Op: cmd.Op,
 		}
 
 	default:

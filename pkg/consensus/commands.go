@@ -14,6 +14,7 @@ const (
 	OpAddNode        = "ADD_NODE"
 	OpRemoveNode     = "REMOVE_NODE"
 	OpCommitConfig   = "COMMIT_CONFIG"
+	OpDebugNoop      = "DEBUG_NOOP"
 	ClusterMatchID   = "_cluster"
 )
 
@@ -41,6 +42,11 @@ type ApplyTurnPayload struct {
 	PlayerID   string            `json:"player_id"`
 	Tile       models.DominoTile `json:"tile,omitempty"`
 	PlayAtLeft bool              `json:"play_at_left,omitempty"`
+}
+
+// DebugNoopPayload is a diagnostic log entry that skips game-state validation.
+type DebugNoopPayload struct {
+	Message string `json:"message"`
 }
 
 // LedgerBalancePayload records a committed player career balance adjustment.
@@ -100,6 +106,11 @@ func IsMembershipOp(op string) bool {
 	}
 }
 
+// IsNonMatchOp reports whether op does not target a live match session.
+func IsNonMatchOp(op string) bool {
+	return IsMembershipOp(op) || op == OpDebugNoop
+}
+
 // DecodeCommand unmarshals a replicated log entry into a Command.
 func DecodeCommand(logEntry []byte) (Command, error) {
 	var cmd Command
@@ -109,7 +120,7 @@ func DecodeCommand(logEntry []byte) (Command, error) {
 	if cmd.Op == "" {
 		return Command{}, fmt.Errorf("command op is required")
 	}
-	if cmd.MatchID == "" && !IsMembershipOp(cmd.Op) {
+	if cmd.MatchID == "" && !IsNonMatchOp(cmd.Op) {
 		return Command{}, fmt.Errorf("command match_id is required")
 	}
 	return cmd, nil
@@ -166,6 +177,25 @@ func EncodeRemoveNodeCommand(nodeID string) ([]byte, error) {
 // EncodeCommitConfigCommand marshals the joint-consensus exit step.
 func EncodeCommitConfigCommand() ([]byte, error) {
 	return EncodeCommandWithPayload(OpCommitConfig, ClusterMatchID, nil)
+}
+
+// EncodeDebugNoopCommand marshals a no-op diagnostic entry for log compaction testing.
+func EncodeDebugNoopCommand(message string) ([]byte, error) {
+	return EncodeCommandWithPayload(OpDebugNoop, ClusterMatchID, DebugNoopPayload{
+		Message: message,
+	})
+}
+
+// DecodeDebugNoopPayload unmarshals the DEBUG_NOOP payload bytes.
+func DecodeDebugNoopPayload(payload []byte) (DebugNoopPayload, error) {
+	if len(payload) == 0 {
+		return DebugNoopPayload{}, nil
+	}
+	var out DebugNoopPayload
+	if err := json.Unmarshal(payload, &out); err != nil {
+		return DebugNoopPayload{}, fmt.Errorf("decode debug noop payload: %w", err)
+	}
+	return out, nil
 }
 
 // DecodeStartMatchPayload unmarshals the START_MATCH payload bytes.

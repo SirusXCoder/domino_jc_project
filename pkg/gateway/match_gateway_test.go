@@ -117,6 +117,21 @@ func waitForGatewayLeader(t *testing.T, rafts []*consensus.RaftNode) *consensus.
 	}
 }
 
+func waitForFollowerLeaderEndpoint(t *testing.T, follower *consensus.RaftNode) {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	for {
+		if _, _, err := follower.LeaderEndpoint(); err == nil {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for follower to learn cluster leader")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
 func proposeGatewayStartMatch(t *testing.T, leader *consensus.RaftNode, matchID string, players []string) {
 	t.Helper()
 	entry, err := consensus.EncodeCommandWithPayload(
@@ -150,6 +165,126 @@ func mutateBody(clientID string, seq uint64, matchID string, action MatchActionD
 		panic(err)
 	}
 	return body
+}
+
+func TestMatchGateway_CreateEmptyMatch(t *testing.T) {
+	rafts, managers, cleanup := startMatchGatewayCluster(t)
+	defer cleanup()
+
+	leader := waitForGatewayLeader(t, rafts)
+
+	leaderIdx := 0
+	for i, raft := range rafts {
+		if raft.NodeID == leader.NodeID {
+			leaderIdx = i
+			break
+		}
+	}
+
+	gateway := NewMatchGateway(rafts[leaderIdx], managers[leaderIdx])
+	mux := http.NewServeMux()
+	gateway.Register(mux)
+
+	body := []byte(`{"player_uids":["p1","p2"]}`)
+	req := httptest.NewRequest(http.MethodPost, "/match/create", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want %d, body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+
+	var resp MatchCreateResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+	if !resp.OK || resp.MatchID == "" {
+		t.Fatalf("unexpected create response: %+v", resp)
+	}
+
+	session, ok := managers[leaderIdx].GetSession(context.Background(), resp.MatchID)
+	if !ok || session == nil {
+		t.Fatal("expected created session in manager")
+	}
+	if session.Status != models.SessionStatusWaiting {
+		t.Fatalf("session status = %q, want %q", session.Status, models.SessionStatusWaiting)
+	}
+	if len(session.GameBoard) != 0 || len(session.Boneyard) != 0 {
+		t.Fatalf("expected empty board and boneyard: board=%d boneyard=%d", len(session.GameBoard), len(session.Boneyard))
+	}
+}
+
+func TestMatchGateway_CreateForwardsToLeader(t *testing.T) {
+	rafts, managers, cleanup := startMatchGatewayCluster(t)
+	defer cleanup()
+
+	leader := waitForGatewayLeader(t, rafts)
+
+	var leaderIdx, followerIdx int
+	for i, raft := range rafts {
+		if raft.NodeID == leader.NodeID {
+			leaderIdx = i
+		} else if followerIdx == 0 && !raft.IsLeader() {
+			followerIdx = i
+		}
+	}
+
+	leaderGateway := NewMatchGateway(rafts[leaderIdx], managers[leaderIdx])
+	leaderMux := http.NewServeMux()
+	leaderGateway.Register(leaderMux)
+	leaderServer := httptest.NewServer(leaderMux)
+	defer leaderServer.Close()
+
+	followerGateway := NewMatchGateway(
+		rafts[followerIdx],
+		managers[followerIdx],
+		WithHTTPPeerAddresses(map[string]string{
+			leader.NodeID: leaderServer.URL,
+		}),
+	)
+	followerMux := http.NewServeMux()
+	followerGateway.Register(followerMux)
+	waitForFollowerLeaderEndpoint(t, rafts[followerIdx])
+
+	body := []byte(`{}`)
+	req := httptest.NewRequest(http.MethodPost, "/match/create", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	followerMux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("forwarded create status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+
+	var resp MatchCreateResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+	if !resp.OK || resp.MatchID == "" {
+		t.Fatalf("unexpected create response: %+v", resp)
+	}
+
+	session := waitForSessionOnCluster(t, managers, resp.MatchID)
+	if len(session.Players) != 2 {
+		t.Fatalf("players = %d, want 2", len(session.Players))
+	}
+}
+
+func waitForSessionOnCluster(t *testing.T, managers []*engine.GameManager, matchID string) *models.GameSession {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		for _, mgr := range managers {
+			if session, ok := mgr.GetSession(context.Background(), matchID); ok && session != nil {
+				return session
+			}
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("session %q not found on any cluster node", matchID)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	return nil
 }
 
 func TestMatchGateway_ReadReturnsSession(t *testing.T) {
@@ -354,5 +489,64 @@ func TestMatchGateway_NoLeaderReturnsRetryAfter(t *testing.T) {
 	}
 	if rec.Header().Get("Retry-After") == "" {
 		t.Fatal("expected Retry-After header when leader is unknown")
+	}
+}
+
+func TestMatchGateway_LeaderHTTPBaseAddsScheme(t *testing.T) {
+	gateway := NewMatchGateway(nil, nil, WithHTTPPeerAddresses(map[string]string{
+		"node-1": "raft-1:8080",
+		"node-2": "http://raft-2:8080/",
+	}))
+
+	if base := gateway.leaderHTTPBase("node-1", "raft-1:50051"); base != "http://raft-1:8080" {
+		t.Fatalf("node-1 base = %q, want http://raft-1:8080", base)
+	}
+	if base := gateway.leaderHTTPBase("node-2", "raft-2:50051"); base != "http://raft-2:8080" {
+		t.Fatalf("node-2 base = %q, want http://raft-2:8080", base)
+	}
+	if base := gateway.leaderHTTPBase("node-3", "raft-3:50051"); base != "http://raft-3:50051" {
+		t.Fatalf("fallback base = %q, want http://raft-3:50051", base)
+	}
+}
+
+func TestMatchGateway_FillLogProposesDebugNoops(t *testing.T) {
+	rafts, _, cleanup := startMatchGatewayCluster(t)
+	defer cleanup()
+
+	leader := waitForGatewayLeader(t, rafts)
+	leader.SetCompactThreshold(25)
+
+	var leaderIdx int
+	for i, raft := range rafts {
+		if raft.NodeID == leader.NodeID {
+			leaderIdx = i
+			break
+		}
+	}
+
+	gateway := NewMatchGateway(rafts[leaderIdx], nil)
+	mux := http.NewServeMux()
+	gateway.Register(mux)
+
+	req := httptest.NewRequest(http.MethodPost, "/debug/fill-log", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var resp FillLogResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !resp.OK || resp.Proposed != defaultFillLogCount {
+		t.Fatalf("response = %+v, want ok=true proposed=%d", resp, defaultFillLogCount)
+	}
+	if resp.SnapshotIndex == 0 {
+		t.Fatalf("expected snapshot after %d entries with threshold 25, got snapshot_index=0", defaultFillLogCount)
+	}
+	if resp.UncompactedEntries >= 25 {
+		t.Fatalf("uncompacted_entries = %d, want < 25 after compaction", resp.UncompactedEntries)
 	}
 }

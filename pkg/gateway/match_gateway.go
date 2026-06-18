@@ -3,6 +3,8 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,7 +23,12 @@ import (
 const (
 	defaultForwardTimeout = 5 * time.Second
 	defaultRetryAfterSecs = 2
+	matchCreatePath       = "/match/create"
 	matchMutatePath       = "/match/mutate"
+	debugFillLogPath      = "/debug/fill-log"
+	defaultCreatePlayers  = 2
+	defaultFillLogCount   = 50
+	fillLogTimeout        = 60 * time.Second
 )
 
 // MatchActionData carries a normalized player turn submitted through the HTTP gateway.
@@ -30,6 +37,21 @@ type MatchActionData struct {
 	PlayerID   string            `json:"player_id"`
 	Tile       models.DominoTile `json:"tile,omitempty"`
 	PlayAtLeft bool              `json:"play_at_left,omitempty"`
+}
+
+// MatchCreateRequest is the JSON body for POST /match/create.
+type MatchCreateRequest struct {
+	MatchID      string   `json:"match_id,omitempty"`
+	PlayerUIDs   []string `json:"player_uids,omitempty"`
+	SetupGame    bool     `json:"setup_game,omitempty"`
+	TilesPerHand int      `json:"tiles_per_hand,omitempty"`
+}
+
+// MatchCreateResponse is returned by POST /match/create.
+type MatchCreateResponse struct {
+	OK      bool   `json:"ok"`
+	MatchID string `json:"match_id,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 // MatchMutateRequest is the JSON body for POST /match/mutate.
@@ -55,6 +77,16 @@ type MatchReadResponse struct {
 	Session *models.GameSession  `json:"session,omitempty"`
 	NodeID  string               `json:"node_id,omitempty"`
 	State   string               `json:"state,omitempty"`
+}
+
+// FillLogResponse is returned by POST /debug/fill-log.
+type FillLogResponse struct {
+	OK                  bool   `json:"ok"`
+	Proposed            int    `json:"proposed"`
+	SnapshotIndex       uint64 `json:"snapshot_index"`
+	UncompactedEntries  uint64 `json:"uncompacted_entries"`
+	NodeID              string `json:"node_id,omitempty"`
+	Error               string `json:"error,omitempty"`
 }
 
 // MatchGateway exposes the external client API boundary with leader forwarding
@@ -118,10 +150,12 @@ func NewMatchGateway(
 	return g
 }
 
-// Register mounts /match/read and /match/mutate on the provided mux.
+// Register mounts /match/read, /match/create, /match/mutate, and /debug/fill-log on the provided mux.
 func (g *MatchGateway) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/match/read", g.handleRead)
+	mux.HandleFunc("/match/create", g.handleCreate)
 	mux.HandleFunc("/match/mutate", g.handleMutate)
+	mux.HandleFunc("/debug/fill-log", g.handleFillLog)
 }
 
 func (g *MatchGateway) handleRead(w http.ResponseWriter, r *http.Request) {
@@ -152,6 +186,174 @@ func (g *MatchGateway) handleRead(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeGatewayJSON(w, http.StatusOK, resp)
+}
+
+func (g *MatchGateway) handleCreate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeGatewayJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if g.raft == nil {
+		writeGatewayJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "raft node is not configured"})
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeGatewayJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		body = []byte("{}")
+	}
+
+	var req MatchCreateRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeGatewayJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON payload"})
+		return
+	}
+	if err := normalizeCreateRequest(&req); err != nil {
+		writeGatewayJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
+	if !g.raft.IsLeader() {
+		g.forwardCreateToLeader(w, r, body, req)
+		return
+	}
+
+	g.processLocalCreate(w, r.Context(), req)
+}
+
+func (g *MatchGateway) forwardCreateToLeader(
+	w http.ResponseWriter,
+	r *http.Request,
+	body []byte,
+	req MatchCreateRequest,
+) {
+	logger := telemetry.LoggerWithTrace(g.logger, r.Context())
+
+	leaderID, leaderRaftAddr, err := g.raft.LeaderEndpoint()
+	if err != nil {
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", defaultRetryAfterSecs))
+		writeGatewayJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"error":   "cluster leader is unavailable",
+			"details": err.Error(),
+			"node_id": g.raft.NodeID,
+			"state":   nodeState(g.raft),
+		})
+		return
+	}
+
+	targetBase := g.leaderHTTPBase(leaderID, leaderRaftAddr)
+	targetURL := strings.TrimRight(targetBase, "/") + matchCreatePath
+
+	logger.Info("Forwarding match create request to cluster leader",
+		slog.String("match_id", req.MatchID),
+		slog.String("leader_id", leaderID),
+		slog.String("leader_url", targetURL),
+		slog.String("node_id", g.raft.NodeID),
+	)
+
+	ctx, cancel := context.WithTimeout(r.Context(), g.forwardTimeout)
+	defer cancel()
+
+	proxyReq, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
+	if err != nil {
+		writeGatewayJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to build leader proxy request"})
+		return
+	}
+	proxyReq.Header.Set("Content-Type", "application/json")
+	if traceID := telemetry.TraceIDFromContext(r.Context()); traceID != "" {
+		proxyReq.Header.Set(telemetry.TraceIDHeader, traceID)
+	}
+
+	proxyResp, err := g.httpClient.Do(proxyReq)
+	if err != nil {
+		logger.Warn("Leader proxy create request failed",
+			slog.String("leader_id", leaderID),
+			slog.Any("error", err),
+		)
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", defaultRetryAfterSecs))
+		writeGatewayJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"error":      "leader proxy request failed",
+			"leader_id":  leaderID,
+			"forward_to": targetURL,
+		})
+		return
+	}
+	defer proxyResp.Body.Close()
+
+	for key, values := range proxyResp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(proxyResp.StatusCode)
+	_, _ = io.Copy(w, proxyResp.Body)
+}
+
+func (g *MatchGateway) processLocalCreate(w http.ResponseWriter, ctx context.Context, req MatchCreateRequest) {
+	matchID := strings.TrimSpace(req.MatchID)
+	if matchID == "" {
+		generated, err := generateMatchID()
+		if err != nil {
+			writeGatewayJSON(w, http.StatusInternalServerError, MatchCreateResponse{
+				OK:    false,
+				Error: "failed to generate match_id",
+			})
+			return
+		}
+		matchID = generated
+	}
+
+	command, err := consensus.EncodeCommandWithPayload(
+		consensus.OpStartMatch,
+		matchID,
+		consensus.StartMatchPayload{
+			PlayerUIDs:   req.PlayerUIDs,
+			SetupGame:    req.SetupGame,
+			TilesPerHand: req.TilesPerHand,
+		},
+	)
+	if err != nil {
+		writeGatewayJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to encode match create"})
+		return
+	}
+
+	raw, err := g.raft.ProposeAndWaitTimeout(command, g.forwardTimeout)
+	if err != nil {
+		g.writeProposalError(w, err)
+		return
+	}
+	if consensus.IsApplyError(raw) {
+		if asErr, ok := raw.(error); ok {
+			writeGatewayJSON(w, http.StatusConflict, MatchCreateResponse{
+				OK:    false,
+				Error: asErr.Error(),
+			})
+			return
+		}
+		writeGatewayJSON(w, http.StatusConflict, MatchCreateResponse{
+			OK:    false,
+			Error: fmt.Sprintf("match create rejected: %v", raw),
+		})
+		return
+	}
+
+	applyResult, ok := consensus.AsApplyResult(raw)
+	if !ok || !applyResult.OK {
+		writeGatewayJSON(w, http.StatusConflict, MatchCreateResponse{
+			OK:    false,
+			Error: "match create returned no confirmation",
+		})
+		return
+	}
+
+	writeGatewayJSON(w, http.StatusCreated, MatchCreateResponse{
+		OK:      true,
+		MatchID: applyResult.MatchID,
+	})
 }
 
 func (g *MatchGateway) handleMutate(w http.ResponseWriter, r *http.Request) {
@@ -311,6 +513,151 @@ func (g *MatchGateway) processLocalMutate(w http.ResponseWriter, ctx context.Con
 	writeGatewayJSON(w, http.StatusOK, resp)
 }
 
+func (g *MatchGateway) handleFillLog(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeGatewayJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if g.raft == nil {
+		writeGatewayJSON(w, http.StatusServiceUnavailable, FillLogResponse{
+			OK:    false,
+			Error: "raft node is not configured",
+		})
+		return
+	}
+
+	if !g.raft.IsLeader() {
+		g.forwardFillLogToLeader(w, r)
+		return
+	}
+
+	g.processLocalFillLog(w)
+}
+
+func (g *MatchGateway) forwardFillLogToLeader(w http.ResponseWriter, r *http.Request) {
+	logger := telemetry.LoggerWithTrace(g.logger, r.Context())
+
+	leaderID, leaderRaftAddr, err := g.raft.LeaderEndpoint()
+	if err != nil {
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", defaultRetryAfterSecs))
+		writeGatewayJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"error":   "cluster leader is unavailable",
+			"details": err.Error(),
+			"node_id": g.raft.NodeID,
+			"state":   nodeState(g.raft),
+		})
+		return
+	}
+
+	targetBase := g.leaderHTTPBase(leaderID, leaderRaftAddr)
+	targetURL := strings.TrimRight(targetBase, "/") + debugFillLogPath
+
+	logger.Info("Forwarding debug fill-log request to cluster leader",
+		slog.String("leader_id", leaderID),
+		slog.String("leader_url", targetURL),
+		slog.String("node_id", g.raft.NodeID),
+	)
+
+	ctx, cancel := context.WithTimeout(r.Context(), fillLogTimeout)
+	defer cancel()
+
+	proxyReq, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, nil)
+	if err != nil {
+		writeGatewayJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to build leader proxy request"})
+		return
+	}
+	if traceID := telemetry.TraceIDFromContext(r.Context()); traceID != "" {
+		proxyReq.Header.Set(telemetry.TraceIDHeader, traceID)
+	}
+
+	fillLogClient := &http.Client{Timeout: fillLogTimeout}
+	proxyResp, err := fillLogClient.Do(proxyReq)
+	if err != nil {
+		logger.Warn("Leader proxy fill-log request failed",
+			slog.String("leader_id", leaderID),
+			slog.Any("error", err),
+		)
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", defaultRetryAfterSecs))
+		writeGatewayJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"error":      "leader proxy request failed",
+			"leader_id":  leaderID,
+			"forward_to": targetURL,
+		})
+		return
+	}
+	defer proxyResp.Body.Close()
+
+	for key, values := range proxyResp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(proxyResp.StatusCode)
+	_, _ = io.Copy(w, proxyResp.Body)
+}
+
+func (g *MatchGateway) processLocalFillLog(w http.ResponseWriter) {
+	deadline := time.Now().Add(fillLogTimeout)
+	proposed := 0
+
+	for i := 0; i < defaultFillLogCount; i++ {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			writeGatewayJSON(w, http.StatusGatewayTimeout, FillLogResponse{
+				OK:       false,
+				Proposed: proposed,
+				NodeID:   g.raft.NodeID,
+				Error:    fmt.Sprintf("timed out after proposing %d entries", proposed),
+			})
+			return
+		}
+
+		command, err := consensus.EncodeDebugNoopCommand(fmt.Sprintf("debug-fill-%d", i+1))
+		if err != nil {
+			writeGatewayJSON(w, http.StatusInternalServerError, FillLogResponse{
+				OK:       false,
+				Proposed: proposed,
+				NodeID:   g.raft.NodeID,
+				Error:    "failed to encode debug noop entry",
+			})
+			return
+		}
+
+		raw, err := g.raft.ProposeAndWaitTimeout(command, remaining)
+		if err != nil {
+			g.writeProposalError(w, err)
+			return
+		}
+		if consensus.IsApplyError(raw) {
+			if asErr, ok := raw.(error); ok {
+				writeGatewayJSON(w, http.StatusInternalServerError, FillLogResponse{
+					OK:       false,
+					Proposed: proposed,
+					NodeID:   g.raft.NodeID,
+					Error:    asErr.Error(),
+				})
+				return
+			}
+			writeGatewayJSON(w, http.StatusInternalServerError, FillLogResponse{
+				OK:       false,
+				Proposed: proposed,
+				NodeID:   g.raft.NodeID,
+				Error:    fmt.Sprintf("debug noop rejected: %v", raw),
+			})
+			return
+		}
+		proposed++
+	}
+
+	writeGatewayJSON(w, http.StatusOK, FillLogResponse{
+		OK:                 true,
+		Proposed:           proposed,
+		SnapshotIndex:      g.raft.SnapshotIndex(),
+		UncompactedEntries: g.raft.UncompactedLogEntries(),
+		NodeID:             g.raft.NodeID,
+	})
+}
+
 func (g *MatchGateway) writeProposalError(w http.ResponseWriter, err error) {
 	var redirect *consensus.LeaderRedirectError
 	if errors.As(err, &redirect) {
@@ -331,13 +678,60 @@ func (g *MatchGateway) writeProposalError(w http.ResponseWriter, err error) {
 func (g *MatchGateway) leaderHTTPBase(leaderID, raftAddr string) string {
 	if g.httpPeerAddresses != nil {
 		if base, ok := g.httpPeerAddresses[leaderID]; ok && base != "" {
-			return base
+			return normalizeHTTPBase(base)
 		}
 	}
-	if strings.HasPrefix(raftAddr, "http://") || strings.HasPrefix(raftAddr, "https://") {
-		return raftAddr
+	return normalizeHTTPBase(raftAddr)
+}
+
+func normalizeHTTPBase(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return ""
 	}
-	return "http://" + raftAddr
+	if strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://") {
+		return strings.TrimRight(addr, "/")
+	}
+	host := addr
+	if strings.HasPrefix(addr, ":") {
+		host = "localhost" + addr
+	}
+	return "http://" + host
+}
+
+func normalizeCreateRequest(req *MatchCreateRequest) error {
+	if req == nil {
+		return fmt.Errorf("request is required")
+	}
+
+	if len(req.PlayerUIDs) == 0 {
+		req.PlayerUIDs = make([]string, defaultCreatePlayers)
+		for i := range req.PlayerUIDs {
+			req.PlayerUIDs[i] = fmt.Sprintf("p%d", i+1)
+		}
+	}
+
+	cleaned := make([]string, 0, len(req.PlayerUIDs))
+	for _, uid := range req.PlayerUIDs {
+		uid = strings.TrimSpace(uid)
+		if uid == "" {
+			continue
+		}
+		cleaned = append(cleaned, uid)
+	}
+	if len(cleaned) == 0 {
+		return fmt.Errorf("at least one player_uid is required")
+	}
+	req.PlayerUIDs = cleaned
+	return nil
+}
+
+func generateMatchID() (string, error) {
+	var entropy [16]byte
+	if _, err := rand.Read(entropy[:]); err != nil {
+		return "", err
+	}
+	return "match-" + hex.EncodeToString(entropy[:]), nil
 }
 
 func validateMutateRequest(req MatchMutateRequest) error {
