@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -25,6 +26,7 @@ const (
 	defaultRetryAfterSecs = 2
 	matchCreatePath       = "/match/create"
 	matchMutatePath       = "/match/mutate"
+	matchStatePath        = "/match/state"
 	debugFillLogPath      = "/debug/fill-log"
 	defaultCreatePlayers  = 2
 	defaultFillLogCount   = 50
@@ -59,6 +61,7 @@ type MatchMutateRequest struct {
 	ClientID       string          `json:"client_id"`
 	SequenceNumber uint64          `json:"sequence_number"`
 	MatchID        string          `json:"match_id"`
+	PlayerID       string          `json:"player_id,omitempty"`
 	ActionData     json.RawMessage `json:"action_data"`
 }
 
@@ -77,6 +80,17 @@ type MatchReadResponse struct {
 	Session *models.GameSession  `json:"session,omitempty"`
 	NodeID  string               `json:"node_id,omitempty"`
 	State   string               `json:"state,omitempty"`
+}
+
+// MatchStateResponse is returned by GET /match/state with a player-scoped masked view.
+type MatchStateResponse struct {
+	MatchID  string              `json:"match_id"`
+	PlayerID string              `json:"player_id"`
+	Found    bool                `json:"found"`
+	Session  *models.GameSession `json:"session,omitempty"`
+	NodeID   string              `json:"node_id,omitempty"`
+	State    string              `json:"state,omitempty"`
+	Error    string              `json:"error,omitempty"`
 }
 
 // FillLogResponse is returned by POST /debug/fill-log.
@@ -150,9 +164,10 @@ func NewMatchGateway(
 	return g
 }
 
-// Register mounts /match/read, /match/create, /match/mutate, and /debug/fill-log on the provided mux.
+// Register mounts /match/read, /match/state, /match/create, /match/mutate, and /debug/fill-log on the provided mux.
 func (g *MatchGateway) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/match/read", g.handleRead)
+	mux.HandleFunc("/match/state", g.handleState)
 	mux.HandleFunc("/match/create", g.handleCreate)
 	mux.HandleFunc("/match/mutate", g.handleMutate)
 	mux.HandleFunc("/debug/fill-log", g.handleFillLog)
@@ -186,6 +201,176 @@ func (g *MatchGateway) handleRead(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeGatewayJSON(w, http.StatusOK, resp)
+}
+
+func (g *MatchGateway) handleState(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeGatewayJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if g.raft == nil {
+		writeGatewayJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "raft node is not configured"})
+		return
+	}
+	if g.manager == nil {
+		writeGatewayJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "game manager is not configured"})
+		return
+	}
+
+	matchID := strings.TrimSpace(r.URL.Query().Get("match_id"))
+	if matchID == "" {
+		writeGatewayJSON(w, http.StatusBadRequest, map[string]string{"error": "match_id is required"})
+		return
+	}
+	playerID := strings.TrimSpace(r.URL.Query().Get("player_id"))
+	if playerID == "" {
+		writeGatewayJSON(w, http.StatusBadRequest, map[string]string{"error": "player_id is required"})
+		return
+	}
+
+	if !g.raft.IsLeader() {
+		g.forwardStateToLeader(w, r, matchID, playerID)
+		return
+	}
+
+	g.processLocalState(w, r.Context(), matchID, playerID)
+}
+
+func (g *MatchGateway) forwardStateToLeader(
+	w http.ResponseWriter,
+	r *http.Request,
+	matchID, playerID string,
+) {
+	logger := telemetry.LoggerWithTrace(g.logger, r.Context())
+
+	leaderID, leaderRaftAddr, err := g.raft.LeaderEndpoint()
+	if err != nil {
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", defaultRetryAfterSecs))
+		writeGatewayJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"error":   "cluster leader is unavailable",
+			"details": err.Error(),
+			"node_id": g.raft.NodeID,
+			"state":   nodeState(g.raft),
+		})
+		return
+	}
+
+	targetBase := g.leaderHTTPBase(leaderID, leaderRaftAddr)
+	query := url.Values{}
+	query.Set("match_id", matchID)
+	query.Set("player_id", playerID)
+	targetURL := strings.TrimRight(targetBase, "/") + matchStatePath + "?" + query.Encode()
+
+	logger.Info("Forwarding state read to cluster leader",
+		slog.String("match_id", matchID),
+		slog.String("player_id", playerID),
+		slog.String("leader_id", leaderID),
+		slog.String("leader_url", targetURL),
+		slog.String("node_id", g.raft.NodeID),
+	)
+
+	ctx, cancel := context.WithTimeout(r.Context(), g.forwardTimeout)
+	defer cancel()
+
+	proxyReq, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		writeGatewayJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to build leader proxy request"})
+		return
+	}
+	if traceID := telemetry.TraceIDFromContext(r.Context()); traceID != "" {
+		proxyReq.Header.Set(telemetry.TraceIDHeader, traceID)
+	}
+
+	proxyResp, err := g.httpClient.Do(proxyReq)
+	if err != nil {
+		logger.Warn("Leader proxy state read failed",
+			slog.String("leader_id", leaderID),
+			slog.Any("error", err),
+		)
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", defaultRetryAfterSecs))
+		writeGatewayJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"error":      "leader proxy request failed",
+			"leader_id":  leaderID,
+			"forward_to": targetURL,
+		})
+		return
+	}
+	defer proxyResp.Body.Close()
+
+	for key, values := range proxyResp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(proxyResp.StatusCode)
+	_, _ = io.Copy(w, proxyResp.Body)
+}
+
+func (g *MatchGateway) processLocalState(w http.ResponseWriter, ctx context.Context, matchID, playerID string) {
+	if err := g.raft.EnsureLinearizableRead(g.forwardTimeout); err != nil {
+		g.writeProposalError(w, err)
+		return
+	}
+
+	session, found := g.manager.GetSession(ctx, matchID)
+	resp := MatchStateResponse{
+		MatchID:  matchID,
+		PlayerID: playerID,
+		Found:    found,
+		NodeID:   g.raft.NodeID,
+		State:    nodeState(g.raft),
+	}
+	if found && session != nil {
+		if !sessionPlayerKnown(session, playerID) {
+			writeGatewayJSON(w, http.StatusBadRequest, MatchStateResponse{
+				MatchID:  matchID,
+				PlayerID: playerID,
+				Error:    "player_id is not part of this match",
+			})
+			return
+		}
+		resp.Session = session.ViewForPlayer(playerID)
+	}
+
+	writeGatewayJSON(w, http.StatusOK, resp)
+}
+
+func sessionPlayerKnown(session *models.GameSession, playerID string) bool {
+	for _, id := range session.Players {
+		if id == playerID {
+			return true
+		}
+	}
+	return false
+}
+
+func (g *MatchGateway) validateMutatePlayerScope(ctx context.Context, req MatchMutateRequest) error {
+	playerID := strings.TrimSpace(req.PlayerID)
+	if playerID == "" || g.manager == nil {
+		return nil
+	}
+	session, found := g.manager.GetSession(ctx, req.MatchID)
+	if !found || session == nil {
+		return nil
+	}
+	if !sessionPlayerKnown(session, playerID) {
+		return fmt.Errorf("player_id is not part of this match")
+	}
+	return nil
+}
+
+func maskApplyResultForPlayer(result consensus.ApplyResult, playerID string) (consensus.ApplyResult, error) {
+	playerID = strings.TrimSpace(playerID)
+	if playerID == "" || result.Session == nil {
+		return result, nil
+	}
+	if !sessionPlayerKnown(result.Session, playerID) {
+		return result, fmt.Errorf("player_id is not part of this match")
+	}
+	masked := result.Session.ViewForPlayer(playerID)
+	out := result
+	out.Session = masked
+	return out, nil
 }
 
 func (g *MatchGateway) handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -381,6 +566,10 @@ func (g *MatchGateway) handleMutate(w http.ResponseWriter, r *http.Request) {
 		writeGatewayJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	if err := g.validateMutatePlayerScope(r.Context(), req); err != nil {
+		writeGatewayJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 
 	if !g.raft.IsLeader() {
 		g.forwardMutateToLeader(w, r, body, req)
@@ -505,9 +694,15 @@ func (g *MatchGateway) processLocalMutate(w http.ResponseWriter, ctx context.Con
 		return
 	}
 
+	maskedResult, err := maskApplyResultForPlayer(applyResult, req.PlayerID)
+	if err != nil {
+		writeGatewayJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
 	resp := MatchMutateResponse{
 		OK:     true,
-		Result: &applyResult,
+		Result: &maskedResult,
 	}
 	g.cache.Put(req.ClientID, req.SequenceNumber, resp)
 	writeGatewayJSON(w, http.StatusOK, resp)

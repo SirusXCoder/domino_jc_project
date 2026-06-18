@@ -969,16 +969,25 @@ func (n *RaftNode) waitForApply(index uint64, timeout time.Duration) (interface{
 	}
 }
 
-// ReadLinearizableState performs a ReadIndex linearizable read without appending to the log.
-func (n *RaftNode) ReadLinearizableState() (map[string]matchState, error) {
+// EnsureLinearizableRead performs a ReadIndex barrier with quorum leadership
+// confirmation so subsequent local state reads are linearizable.
+func (n *RaftNode) EnsureLinearizableRead(timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = defaultProposeTimeout
+	}
 	readIndex, term, err := n.beginReadIndex()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if err := n.confirmLeadershipForRead(term, readIndex); err != nil {
-		return nil, err
+		return err
 	}
-	if err := n.waitForReadIndex(readIndex, defaultProposeTimeout); err != nil {
+	return n.waitForReadIndex(readIndex, timeout)
+}
+
+// ReadLinearizableState performs a ReadIndex linearizable read without appending to the log.
+func (n *RaftNode) ReadLinearizableState() (map[string]matchState, error) {
+	if err := n.EnsureLinearizableRead(defaultProposeTimeout); err != nil {
 		return nil, err
 	}
 

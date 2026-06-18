@@ -222,6 +222,7 @@ func main() {
 			slog.String("addr", *gatewayAddr),
 			slog.String("ws_endpoint", *gatewayAddr+"/ws/connect"),
 			slog.String("match_read", *gatewayAddr+"/match/read"),
+			slog.String("match_state", *gatewayAddr+"/match/state"),
 			slog.String("match_create", *gatewayAddr+"/match/create"),
 			slog.String("match_mutate", *gatewayAddr+"/match/mutate"),
 			slog.String("debug_fill_log", *gatewayAddr+"/debug/fill-log"),

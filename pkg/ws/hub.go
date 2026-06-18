@@ -169,27 +169,12 @@ func (h *Hub) NotifySessionDelta(delta SessionDelta) {
 }
 
 func (h *Hub) handleSessionBroadcast(evt sessionBroadcastEvent) {
-	payload, err := json.Marshal(SessionDeltaPayload{
-		SessionID: evt.delta.MatchID,
-		MatchID:   evt.delta.MatchID,
-		Op:        evt.delta.Op,
-		Applied:   evt.delta.Applied,
-		Session:   evt.delta.Session,
-		Turn:      evt.delta.Turn,
-	})
-	if err != nil {
-		log.Printf("ws: failed to marshal session delta match=%s: %v", evt.delta.MatchID, err)
-		return
-	}
-
-	envelope, err := json.Marshal(EventEnvelope{
-		Type:      EventTypeSessionDelta,
-		Timestamp: time.Now().UnixMilli(),
-		Payload:   payload,
-	})
-	if err != nil {
-		log.Printf("ws: failed to marshal session delta envelope match=%s: %v", evt.delta.MatchID, err)
-		return
+	var session models.GameSession
+	if len(evt.delta.Session) > 0 {
+		if err := json.Unmarshal(evt.delta.Session, &session); err != nil {
+			log.Printf("ws: failed to decode session delta match=%s: %v", evt.delta.MatchID, err)
+			return
+		}
 	}
 
 	h.mu.RLock()
@@ -201,6 +186,11 @@ func (h *Hub) handleSessionBroadcast(evt sessionBroadcastEvent) {
 	}
 
 	for playerID := range players {
+		envelope, err := h.marshalSessionDeltaEnvelope(evt.delta, &session, playerID)
+		if err != nil {
+			log.Printf("ws: failed to marshal session delta match=%s player=%s: %v", evt.delta.MatchID, playerID, err)
+			continue
+		}
 		h.sendToPlayerLocked(evt.delta.MatchID, playerID, envelope)
 	}
 	log.Printf("ws: broadcast session delta match=%s clients=%d op=%s", evt.delta.MatchID, len(players), evt.delta.Op)
@@ -361,23 +351,56 @@ func (h *Hub) sendStateSnapshotLocked(sessionID, playerID string) {
 		return
 	}
 
-	payload, err := json.Marshal(session)
+	envelope, err := h.marshalStateSnapshotEnvelope(session.ViewForPlayer(playerID))
 	if err != nil {
 		log.Printf("ws: failed to marshal state snapshot session=%s player=%s: %v", sessionID, playerID, err)
 		return
 	}
 
-	envelope, err := json.Marshal(EventEnvelope{
+	h.sendToPlayerLocked(sessionID, playerID, envelope)
+}
+
+func (h *Hub) marshalStateSnapshotEnvelope(session *models.GameSession) ([]byte, error) {
+	payload, err := json.Marshal(session)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(EventEnvelope{
 		Type:      EventTypeStateSnapshot,
 		Timestamp: time.Now().UnixMilli(),
 		Payload:   payload,
 	})
-	if err != nil {
-		log.Printf("ws: failed to marshal snapshot envelope session=%s player=%s: %v", sessionID, playerID, err)
-		return
+}
+
+func (h *Hub) marshalSessionDeltaEnvelope(delta SessionDelta, session *models.GameSession, playerID string) ([]byte, error) {
+	var sessionRaw json.RawMessage
+	if session != nil && session.SessionID != "" {
+		masked := session.ViewForPlayer(playerID)
+		raw, err := json.Marshal(masked)
+		if err != nil {
+			return nil, err
+		}
+		sessionRaw = raw
+	} else if len(delta.Session) > 0 {
+		sessionRaw = delta.Session
 	}
 
-	h.sendToPlayerLocked(sessionID, playerID, envelope)
+	payload, err := json.Marshal(SessionDeltaPayload{
+		SessionID: delta.MatchID,
+		MatchID:   delta.MatchID,
+		Op:        delta.Op,
+		Applied:   delta.Applied,
+		Session:   sessionRaw,
+		Turn:      delta.Turn,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(EventEnvelope{
+		Type:      EventTypeSessionDelta,
+		Timestamp: time.Now().UnixMilli(),
+		Payload:   payload,
+	})
 }
 
 // sendToPlayer enqueues an outbound frame for one connected peer. It must be
@@ -461,22 +484,6 @@ func (h *Hub) TerminateMatch(_ context.Context, sessionID string, outcome *model
 		return
 	}
 
-	sessionPayload, err := json.Marshal(session)
-	if err != nil {
-		log.Printf("ws: failed to marshal final session snapshot session=%s: %v", sessionID, err)
-		return
-	}
-
-	snapshotEnvelope, err := json.Marshal(EventEnvelope{
-		Type:      EventTypeStateSnapshot,
-		Timestamp: time.Now().UnixMilli(),
-		Payload:   sessionPayload,
-	})
-	if err != nil {
-		log.Printf("ws: failed to marshal final snapshot envelope session=%s: %v", sessionID, err)
-		return
-	}
-
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
@@ -486,6 +493,11 @@ func (h *Hub) TerminateMatch(_ context.Context, sessionID string, outcome *model
 	} else {
 		for playerID := range players {
 			h.sendToPlayerLocked(sessionID, playerID, matchEnvelope)
+			snapshotEnvelope, err := h.marshalStateSnapshotEnvelope(session.ViewForPlayer(playerID))
+			if err != nil {
+				log.Printf("ws: failed to marshal final snapshot session=%s player=%s: %v", sessionID, playerID, err)
+				continue
+			}
 			h.sendToPlayerLocked(sessionID, playerID, snapshotEnvelope)
 		}
 	}

@@ -211,12 +211,17 @@ func (f *ManagedGameFSM) Apply(logEntry []byte) interface{} {
 		if err != nil {
 			return err
 		}
+		var session *models.GameSession
+		if s, ok := f.manager.GetSession(f.ctx, cmd.MatchID); ok {
+			session = s
+		}
 		return ApplyResult{
 			OK:      true,
 			Op:      cmd.Op,
 			MatchID: cmd.MatchID,
 			Applied: turn != nil && turn.Applied,
 			Turn:    turn,
+			Session: session,
 		}
 
 	case OpLedgerBalance:

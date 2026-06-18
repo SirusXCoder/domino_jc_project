@@ -35,7 +35,8 @@ func (t DominoTile) String() string {
 type PlayerHand struct {
 	UID       string       `json:"uid,omitempty"`
 	PlayerID  string       `json:"player_id"`
-	Tiles     []DominoTile `json:"tiles"`
+	Tiles             []DominoTile `json:"tiles"`
+	RedactedTileCount int          `json:"tile_count,omitempty"`
 	HasPassed   bool `json:"has_passed"`
 	IsReady     bool `json:"is_ready"`
 	IsAbandoned bool `json:"is_abandoned"`
@@ -49,6 +50,7 @@ type GameSession struct {
 	Players        []string     `json:"players"`
 	Hands          []PlayerHand `json:"hands"`
 	Boneyard       []DominoTile `json:"boneyard"`
+	BoneyardCount  int          `json:"boneyard_count,omitempty"`
 	GameBoard      []DominoTile `json:"game_board"`
 	LeftOpenValue  int          `json:"left_open_value"`
 	RightOpenValue int          `json:"right_open_value"`

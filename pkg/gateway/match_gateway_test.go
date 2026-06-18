@@ -151,6 +151,10 @@ func proposeGatewayStartMatch(t *testing.T, leader *consensus.RaftNode, matchID 
 }
 
 func mutateBody(clientID string, seq uint64, matchID string, action MatchActionData) []byte {
+	return mutateBodyWithPlayer(clientID, seq, matchID, "", action)
+}
+
+func mutateBodyWithPlayer(clientID string, seq uint64, matchID, playerID string, action MatchActionData) []byte {
 	actionRaw, err := json.Marshal(action)
 	if err != nil {
 		panic(err)
@@ -159,6 +163,7 @@ func mutateBody(clientID string, seq uint64, matchID string, action MatchActionD
 		ClientID:       clientID,
 		SequenceNumber: seq,
 		MatchID:        matchID,
+		PlayerID:       playerID,
 		ActionData:     actionRaw,
 	})
 	if err != nil {
@@ -324,6 +329,168 @@ func TestMatchGateway_ReadReturnsSession(t *testing.T) {
 	}
 	if resp.Session.Status != models.SessionStatusActive {
 		t.Fatalf("session status = %q, want active", resp.Session.Status)
+	}
+}
+
+func TestMatchGateway_StateReturnsMaskedSession(t *testing.T) {
+	rafts, managers, cleanup := startMatchGatewayCluster(t)
+	defer cleanup()
+
+	leader := waitForGatewayLeader(t, rafts)
+	const matchID = "gateway-state-match"
+	proposeGatewayStartMatch(t, leader, matchID, []string{"p1", "p2"})
+
+	leaderIdx := 0
+	for i, raft := range rafts {
+		if raft.NodeID == leader.NodeID {
+			leaderIdx = i
+			break
+		}
+	}
+
+	gateway := NewMatchGateway(rafts[leaderIdx], managers[leaderIdx])
+	mux := http.NewServeMux()
+	gateway.Register(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/match/state?match_id="+matchID+"&player_id=p1", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("state status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var resp MatchStateResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal state response: %v", err)
+	}
+	if !resp.Found || resp.Session == nil {
+		t.Fatalf("expected masked session in state response: %+v", resp)
+	}
+	if len(resp.Session.Hands[0].Tiles) == 0 {
+		t.Fatal("expected requesting player to see own tiles")
+	}
+	if len(resp.Session.Hands[1].Tiles) != 0 {
+		t.Fatalf("opponent tiles should be redacted, got %d", len(resp.Session.Hands[1].Tiles))
+	}
+	if resp.Session.Hands[1].RedactedTileCount == 0 {
+		t.Fatal("expected opponent tile_count to be populated")
+	}
+}
+
+func TestMatchGateway_StateForwardsToLeader(t *testing.T) {
+	rafts, managers, cleanup := startMatchGatewayCluster(t)
+	defer cleanup()
+
+	leader := waitForGatewayLeader(t, rafts)
+	const matchID = "gateway-state-forward"
+	proposeGatewayStartMatch(t, leader, matchID, []string{"p1", "p2"})
+
+	var leaderIdx, followerIdx int
+	for i, raft := range rafts {
+		if raft.NodeID == leader.NodeID {
+			leaderIdx = i
+		} else if followerIdx == 0 && !raft.IsLeader() {
+			followerIdx = i
+		}
+	}
+
+	leaderGateway := NewMatchGateway(rafts[leaderIdx], managers[leaderIdx])
+	leaderMux := http.NewServeMux()
+	leaderGateway.Register(leaderMux)
+	leaderServer := httptest.NewServer(leaderMux)
+	defer leaderServer.Close()
+
+	followerGateway := NewMatchGateway(
+		rafts[followerIdx],
+		managers[followerIdx],
+		WithHTTPPeerAddresses(map[string]string{
+			leader.NodeID: leaderServer.URL,
+		}),
+	)
+	followerMux := http.NewServeMux()
+	followerGateway.Register(followerMux)
+	waitForFollowerLeaderEndpoint(t, rafts[followerIdx])
+
+	req := httptest.NewRequest(http.MethodGet, "/match/state?match_id="+matchID+"&player_id=p2", nil)
+	rec := httptest.NewRecorder()
+	followerMux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("forwarded state status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+
+	var resp MatchStateResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal state response: %v", err)
+	}
+	if !resp.Found || resp.Session == nil {
+		t.Fatalf("unexpected state response: %+v", resp)
+	}
+	if len(resp.Session.Hands[1].Tiles) == 0 {
+		t.Fatal("expected p2 to see own tiles via forwarded read")
+	}
+}
+
+func TestMatchGateway_MutateReturnsMaskedStateWhenPlayerIDPresent(t *testing.T) {
+	rafts, managers, cleanup := startMatchGatewayCluster(t)
+	defer cleanup()
+
+	leader := waitForGatewayLeader(t, rafts)
+	const matchID = "gateway-mutate-mask"
+	proposeGatewayStartMatch(t, leader, matchID, []string{"p1", "p2"})
+
+	leaderIdx := 0
+	for i, raft := range rafts {
+		if raft.NodeID == leader.NodeID {
+			leaderIdx = i
+			break
+		}
+	}
+
+	session, ok := managers[leaderIdx].GetSession(context.Background(), matchID)
+	if !ok {
+		t.Fatal("expected started session")
+	}
+	firstTile := session.Hands[0].Tiles[0]
+
+	gateway := NewMatchGateway(rafts[leaderIdx], managers[leaderIdx])
+	mux := http.NewServeMux()
+	gateway.Register(mux)
+
+	body := mutateBodyWithPlayer("client-mask", 1, matchID, "p1", MatchActionData{
+		Kind:       string(models.TurnKindPlayTile),
+		PlayerID:   "p1",
+		Tile:       firstTile,
+		PlayAtLeft: true,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/match/mutate", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("mutate status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+
+	var resp MatchMutateResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal mutate response: %v", err)
+	}
+	if !resp.OK || resp.Result == nil || resp.Result.Session == nil {
+		t.Fatalf("unexpected mutate response: %+v", resp)
+	}
+	if len(resp.Result.Session.Hands[0].Tiles) == 0 {
+		t.Fatal("expected requesting player to see own tiles in mutate result")
+	}
+	if len(resp.Result.Session.Hands[1].Tiles) != 0 {
+		t.Fatalf("opponent tiles should be redacted, got %d", len(resp.Result.Session.Hands[1].Tiles))
+	}
+	if resp.Result.Session.Hands[1].RedactedTileCount == 0 {
+		t.Fatal("expected opponent tile_count in masked mutate result")
+	}
+	if len(resp.Result.Session.GameBoard) != 1 {
+		t.Fatalf("board tiles = %d, want 1 after play", len(resp.Result.Session.GameBoard))
 	}
 }
 
