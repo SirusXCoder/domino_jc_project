@@ -1,10 +1,12 @@
 package models
 
 import (
-	"crypto/rand"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"math/big"
+	"math/rand"
 )
 
 // NewPlayerHand returns an empty hand for the given player.
@@ -170,7 +172,7 @@ func (s *GameSession) GenerateStandardDeck() {
 func (s *GameSession) ShuffleBoneyard() error {
 	n := len(s.Boneyard)
 	for i := n - 1; i > 0; i-- {
-		bg, err := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
+		bg, err := cryptorand.Int(cryptorand.Reader, big.NewInt(int64(i+1)))
 		if err != nil {
 			return err
 		}
@@ -178,6 +180,40 @@ func (s *GameSession) ShuffleBoneyard() error {
 		s.Boneyard[i], s.Boneyard[j] = s.Boneyard[j], s.Boneyard[i]
 	}
 	return nil
+}
+
+// DeterministicSeed derives a stable shuffle seed from a session identifier so
+// every Raft node produces the same deal order for a committed START_MATCH.
+func DeterministicSeed(sessionID string) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(sessionID))
+	return int64(h.Sum64())
+}
+
+// ShuffleBoneyardDeterministic shuffles using a fixed seed for replicated apply.
+func (s *GameSession) ShuffleBoneyardDeterministic(seed int64) error {
+	rng := rand.New(rand.NewSource(seed))
+	n := len(s.Boneyard)
+	for i := n - 1; i > 0; i-- {
+		j := rng.Intn(i + 1)
+		s.Boneyard[i], s.Boneyard[j] = s.Boneyard[j], s.Boneyard[i]
+	}
+	return nil
+}
+
+// ResetForSetup clears dealt tiles and board state before a fresh deal.
+func (s *GameSession) ResetForSetup() {
+	for i := range s.Hands {
+		s.Hands[i].Tiles = nil
+		s.Hands[i].HasPassed = false
+	}
+	s.GameBoard = nil
+	s.Boneyard = nil
+	s.BoneyardRaw = ""
+	s.GameBoardRaw = ""
+	s.LeftOpenValue = -1
+	s.RightOpenValue = -1
+	s.MutationsLocked = false
 }
 
 // BoardEnds returns the current open values on the game board ends.
@@ -316,8 +352,7 @@ func (s *GameSession) DealHands(tilesPerPlayer int) error {
 	}
 
 	for i := range s.Hands {
-		// Slice off a chunk of tiles from the boneyard for the player
-		s.Hands[i].Tiles = append(s.Hands[i].Tiles, s.Boneyard[:tilesPerPlayer]...)
+		s.Hands[i].Tiles = append([]DominoTile(nil), s.Boneyard[:tilesPerPlayer]...)
 		s.Boneyard = s.Boneyard[tilesPerPlayer:]
 	}
 

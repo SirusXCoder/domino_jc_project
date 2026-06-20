@@ -1,0 +1,122 @@
+.domino-tile {
+  display: inline-flex;
+  align-items: stretch;
+  padding: 0;
+  border: 2px solid #2c2416;
+  border-radius: 8px;
+  background: #f5f0e6;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+  cursor: default;
+  font: inherit;
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.domino-tile--horizontal {
+  flex-direction: row;
+  width: 88px;
+  height: 44px;
+}
+
+.domino-tile--vertical {
+  flex-direction: column;
+  width: 44px;
+  height: 88px;
+}
+
+.domino-tile--clickable:not(:disabled) {
+  cursor: pointer;
+}
+
+.domino-tile--playable:not(:disabled) {
+  box-shadow: 0 0 0 3px #3d9a5f, 0 2px 6px rgba(0, 0, 0, 0.25);
+}
+
+.domino-tile--selected:not(:disabled) {
+  transform: translateY(-6px);
+  box-shadow: 0 0 0 3px #e8a317, 0 6px 12px rgba(0, 0, 0, 0.3);
+}
+
+.domino-tile--disabled {
+  opacity: 0.55;
+}
+
+.domino-tile--face-down {
+  background: linear-gradient(135deg, #1a3a5c 0%, #0f2438 100%);
+  border-color: #0a1828;
+}
+
+.domino-back {
+  flex: 1;
+  margin: 4px;
+  border-radius: 4px;
+  background: repeating-linear-gradient(
+    45deg,
+    rgba(255, 255, 255, 0.08) 0,
+    rgba(255, 255, 255, 0.08) 4px,
+    transparent 4px,
+    transparent 8px
+  );
+}
+
+.domino-face {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.domino-divider {
+  width: 2px;
+  background: #2c2416;
+  align-self: stretch;
+}
+
+.domino-tile--vertical .domino-divider {
+  width: auto;
+  height: 2px;
+  align-self: stretch;
+}
+
+.pip {
+  position: absolute;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #1a1510;
+  transform: translate(-50%, -50%);
+}
+
+.pip-top-left {
+  top: 22%;
+  left: 28%;
+}
+
+.pip-top-right {
+  top: 22%;
+  left: 72%;
+}
+
+.pip-center {
+  top: 50%;
+  left: 50%;
+}
+
+.pip-middle-left {
+  top: 50%;
+  left: 28%;
+}
+
+.pip-middle-right {
+  top: 50%;
+  left: 72%;
+}
+
+.pip-bottom-left {
+  top: 78%;
+  left: 28%;
+}
+
+.pip-bottom-right {
+  top: 78%;
+  left: 72%;
+}

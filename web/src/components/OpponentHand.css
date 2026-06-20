@@ -1,0 +1,37 @@
+.opponent-hand-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.opponent-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.opponent-header h2 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  color: #e8dcc8;
+}
+
+.opponent-id {
+  font-size: 0.85rem;
+  color: #9a8b78;
+}
+
+.opponent-count {
+  margin-left: auto;
+  font-size: 0.85rem;
+  color: #b8aa96;
+}
+
+.opponent-tiles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  justify-content: center;
+  min-height: 52px;
+}

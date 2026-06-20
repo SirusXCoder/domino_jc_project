@@ -1,0 +1,74 @@
+.player-hand-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.hand-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.hand-header h2 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  color: #e8dcc8;
+}
+
+.turn-badge {
+  font-size: 0.85rem;
+  padding: 0.25rem 0.65rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #b8aa96;
+}
+
+.turn-badge--active {
+  background: #3d9a5f;
+  color: #fff;
+}
+
+.hand-tiles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  justify-content: center;
+  min-height: 52px;
+}
+
+.play-end-picker {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.65rem 0.85rem;
+  border-radius: 8px;
+  background: rgba(232, 163, 23, 0.15);
+  border: 1px solid rgba(232, 163, 23, 0.4);
+  color: #f5ead6;
+  font-size: 0.9rem;
+}
+
+.play-end-picker button {
+  padding: 0.35rem 0.75rem;
+  border: none;
+  border-radius: 6px;
+  background: #e8a317;
+  color: #1a1510;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.play-end-picker button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.play-end-cancel {
+  background: transparent !important;
+  color: #c9baa4 !important;
+  border: 1px solid rgba(255, 255, 255, 0.2) !important;
+}

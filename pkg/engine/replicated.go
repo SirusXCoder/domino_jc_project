@@ -57,8 +57,9 @@ func (m *GameManager) ApplyReplicatedStartMatch(
 	}
 
 	if setup.SetupGame {
+		session.ResetForSetup()
 		session.GenerateStandardDeck()
-		if err := session.ShuffleBoneyard(); err != nil {
+		if err := session.ShuffleBoneyardDeterministic(models.DeterministicSeed(sessionID)); err != nil {
 			return nil, fmt.Errorf("shuffle boneyard for session %q: %w", sessionID, err)
 		}
 		if err := session.DealHands(tilesPerHand); err != nil {

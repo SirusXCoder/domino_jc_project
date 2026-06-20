@@ -1,0 +1,45 @@
+.app {
+  min-height: 100vh;
+  background: #12100e;
+}
+
+.app--centered {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  min-height: 100vh;
+}
+
+.loading-message {
+  color: #b8aa96;
+  font-size: 1.1rem;
+}
+
+.error-message {
+  color: #e86a6a;
+}
+
+.toast-error {
+  position: fixed;
+  bottom: 1.5rem;
+  left: 50%;
+  transform: translateX(-50%);
+  margin: 0;
+  padding: 0.65rem 1.25rem;
+  border-radius: 8px;
+  background: rgba(232, 106, 106, 0.15);
+  border: 1px solid rgba(232, 106, 106, 0.4);
+  color: #f5a8a8;
+  font-size: 0.9rem;
+}
+
+.app--centered button {
+  padding: 0.5rem 1rem;
+  border: none;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.1);
+  color: #e8dcc8;
+  cursor: pointer;
+}

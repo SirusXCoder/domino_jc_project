@@ -1,0 +1,78 @@
+.connection-panel {
+  max-width: 420px;
+  margin: 4rem auto;
+  padding: 2rem;
+  border-radius: 16px;
+  background: #1e1a16;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+}
+
+.connection-panel h1 {
+  margin: 0 0 0.5rem;
+  font-size: 1.75rem;
+  color: #f5ead6;
+}
+
+.connection-subtitle {
+  margin: 0 0 1.5rem;
+  color: #9a8b78;
+  font-size: 0.95rem;
+}
+
+.connection-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+}
+
+.connection-fields label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+  color: #b8aa96;
+}
+
+.connection-fields input,
+.connection-fields select {
+  padding: 0.55rem 0.75rem;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: #12100e;
+  color: #f5ead6;
+  font-size: 0.95rem;
+}
+
+.connection-actions {
+  display: flex;
+  gap: 0.75rem;
+}
+
+.connection-actions button {
+  flex: 1;
+  padding: 0.65rem 1rem;
+  border: none;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #e8dcc8;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.connection-actions button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.connection-connect {
+  background: #3d9a5f !important;
+  color: #fff !important;
+}
+
+.connection-error {
+  margin: 1rem 0 0;
+  color: #e86a6a;
+  font-size: 0.9rem;
+}
